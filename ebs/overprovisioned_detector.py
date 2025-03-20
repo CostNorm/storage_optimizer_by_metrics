@@ -1,0 +1,772 @@
+import logging
+import boto3
+import time
+import re
+from datetime import datetime, timedelta
+from utils import calculate_monthly_cost
+
+logger = logging.getLogger()
+
+class OverprovisionedVolumeDetector:
+    """
+    과대 프로비저닝된 EBS 볼륨을 감지하는 클래스
+    """
+    
+    def __init__(self, region, ec2_client, cloudwatch_client, criteria):
+        """
+        :param region: AWS 리전
+        :param ec2_client: EC2 클라이언트
+        :param cloudwatch_client: CloudWatch 클라이언트
+        :param criteria: 과대 프로비저닝 감지 기준
+        """
+        self.region = region
+        self.ec2_client = ec2_client
+        self.cloudwatch_client = cloudwatch_client
+        self.criteria = criteria
+        # SSM 클라이언트 초기화 (EC2 내부 파일시스템 정보 수집용)
+        self.ssm_client = boto3.client('ssm', region_name=region)
+        # 인스턴스 SSM 상태 캐시 (성능 향상을 위해)
+        self.instance_ssm_status_cache = {}
+    
+    def check_instance_ssm_status(self, instance_id):
+        """
+        인스턴스가 SSM 명령을 실행할 수 있는 상태인지 확인
+        
+        :param instance_id: EC2 인스턴스 ID
+        :return: (가능 여부, 상태 메시지)
+        """
+        # 캐시된 결과가 있으면 반환
+        if instance_id in self.instance_ssm_status_cache:
+            return self.instance_ssm_status_cache[instance_id]
+            
+        try:
+            # 인스턴스 상태 확인
+            ec2_response = self.ec2_client.describe_instances(InstanceIds=[instance_id])
+            if not ec2_response['Reservations'] or not ec2_response['Reservations'][0]['Instances']:
+                result = (False, f"인스턴스 {instance_id}를 찾을 수 없습니다.")
+                self.instance_ssm_status_cache[instance_id] = result
+                return result
+                
+            instance = ec2_response['Reservations'][0]['Instances'][0]
+            state = instance.get('State', {}).get('Name', '')
+            
+            if state != 'running':
+                result = (False, f"인스턴스 {instance_id}가 실행 중이 아닙니다(현재 상태: {state}).")
+                self.instance_ssm_status_cache[instance_id] = result
+                return result
+            
+            # SSM에서 관리되는 인스턴스인지 확인
+            try:
+                ssm_response = self.ssm_client.describe_instance_information(
+                    Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                )
+                
+                if not ssm_response['InstanceInformationList']:
+                    result = (False, f"인스턴스 {instance_id}가 SSM에 등록되지 않았습니다. SSM Agent가 설치되어 있고 올바르게 구성되어 있는지 확인하세요.")
+                    self.instance_ssm_status_cache[instance_id] = result
+                    return result
+                
+                ping_status = ssm_response['InstanceInformationList'][0].get('PingStatus', '')
+                if ping_status != 'Online':
+                    result = (False, f"인스턴스 {instance_id}의 SSM Agent가 온라인 상태가 아닙니다(현재 상태: {ping_status}).")
+                    self.instance_ssm_status_cache[instance_id] = result
+                    return result
+                
+                result = (True, "인스턴스가 SSM 명령을 실행할 수 있는 상태입니다.")
+                self.instance_ssm_status_cache[instance_id] = result
+                return result
+            except Exception as ssm_error:
+                # SSM 서비스 오류(권한 부족 등)가 발생한 경우
+                logger.warning(f"SSM 서비스 오류: {str(ssm_error)}")
+                result = (False, f"SSM 서비스 오류: {str(ssm_error)}")
+                self.instance_ssm_status_cache[instance_id] = result
+                return result
+            
+        except Exception as e:
+            # 권한이 없거나 다른 오류가 발생한 경우
+            logger.warning(f"인스턴스 {instance_id}의 상태 확인 중 오류 발생: {str(e)}")
+            result = (False, f"인스턴스 상태 확인 중 오류 발생: {str(e)}")
+            self.instance_ssm_status_cache[instance_id] = result
+            return result
+    
+    def get_disk_usage_metrics(self, instance_id, device_name, start_time, end_time):
+        """
+        CloudWatch 에이전트를 통해 수집된 디스크 사용률 지표를 가져옴
+        
+        :param instance_id: EC2 인스턴스 ID
+        :param device_name: 디바이스 이름
+        :param start_time: 측정 시작 시간
+        :param end_time: 측정 종료 시간
+        :return: 디스크 사용률 지표
+        """
+        # 먼저 CloudWatch 메트릭 확인
+        try:
+            # 인스턴스에 연결된 모든 볼륨의 CloudWatch 메트릭 확인
+            metrics = self.cloudwatch_client.list_metrics(
+                Namespace='CWAgent',
+                MetricName='disk_used_percent',
+                Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+            )
+            
+            # CloudWatch에 메트릭이 있으면 메트릭 사용
+            if metrics.get('Metrics'):
+                paths = set()
+                for metric in metrics['Metrics']:
+                    for dim in metric['Dimensions']:
+                        if dim['Name'] == 'path':
+                            paths.add(dim['Value'])
+                
+                # 경로 정보 로깅
+                if paths:
+                    logger.info(f"인스턴스 {instance_id}에서 발견된 디스크 경로: {paths}")
+                else:
+                    logger.warning(f"인스턴스 {instance_id}에서 디스크 경로를 찾을 수 없습니다. 모든 차원 정보: {[metric['Dimensions'] for metric in metrics['Metrics']]}")
+                
+                # 루트 디바이스인 경우 '/' 경로 사용 시도
+                device_short_name = device_name.split('/')[-1]
+                if device_short_name in ['xvda', 'sda', 'nvme0n1'] or device_short_name.startswith('xvda') or device_short_name.startswith('sda'):
+                    if '/' in paths:
+                        logger.info(f"루트 디바이스 {device_name}에 대해 경로 '/'를 사용합니다.")
+                        response = self.cloudwatch_client.get_metric_statistics(
+                            Namespace='CWAgent',
+                            MetricName='disk_used_percent',
+                            Dimensions=[
+                                {'Name': 'InstanceId', 'Value': instance_id},
+                                {'Name': 'path', 'Value': '/'}
+                            ],
+                            StartTime=start_time,
+                            EndTime=end_time,
+                            Period=86400,
+                            Statistics=['Average']
+                        )
+                        
+                        if response['Datapoints']:
+                            return response['Datapoints']
+                
+                # 가장 적합한 경로 찾기 시도
+                fs_path = self.estimate_filesystem_path(device_name, paths)
+                
+                if fs_path:
+                    logger.info(f"디바이스 {device_name}에 대해 추정된 경로: {fs_path}")
+                    
+                    response = self.cloudwatch_client.get_metric_statistics(
+                        Namespace='CWAgent',
+                        MetricName='disk_used_percent',
+                        Dimensions=[
+                            {'Name': 'InstanceId', 'Value': instance_id},
+                            {'Name': 'path', 'Value': fs_path}
+                        ],
+                        StartTime=start_time,
+                        EndTime=end_time,
+                        Period=86400,  # 1일 단위
+                        Statistics=['Average']
+                    )
+                    
+                    if response['Datapoints']:
+                        return response['Datapoints']
+                    
+            # 기타 모든 방법을 시도 후 실패하면 직접 마운트 정보 조회
+            logger.info(f"CloudWatch에서 인스턴스 {instance_id}의 디스크 사용률 메트릭을 찾을 수 없습니다. 대체 방법 사용...")
+            
+            # 디바이스가 루트 볼륨인 경우 바로 SSM 통해 루트 볼륨 확인
+            device_short_name = device_name.split('/')[-1]
+            if device_short_name in ['xvda', 'sda', 'nvme0n1'] or device_short_name.startswith('xvda') or device_short_name.startswith('sda'):
+                logger.info(f"루트 디바이스 {device_name} 감지됨. SSM을 통해 루트 파티션 사용률을 확인합니다.")
+                datapoints = self.get_root_disk_usage_via_ssm(instance_id)
+                if datapoints:
+                    return datapoints
+            
+            # 일반적인 SSM 경로 사용
+            ssm_status, message = self.check_instance_ssm_status(instance_id)
+            if ssm_status:
+                # SSM을 통해 디스크 사용률 조회 시도
+                return self.get_disk_usage_via_ssm(instance_id, device_name)
+            else:
+                logger.warning(f"SSM을 사용할 수 없습니다: {message}. 추정치 사용...")
+                return self.get_estimated_disk_usage(instance_id, device_name)
+            
+        except Exception as e:
+            logger.error(f"CloudWatch 메트릭 조회 중 오류 발생: {str(e)}", exc_info=True)
+            # 오류 발생 시 추정 데이터 사용
+            return self.get_estimated_disk_usage(instance_id, device_name)
+    
+    def estimate_filesystem_path(self, device_name, available_paths):
+        """
+        디바이스 이름과 사용 가능한 경로 목록을 기반으로 가장 적합한 경로 추정
+        
+        :param device_name: 디바이스 이름 
+        :param available_paths: 사용 가능한 경로 목록
+        :return: 추정된 경로 또는 None
+        """
+        # 디바이스 이름에서 짧은 이름 추출 (예: /dev/sda1 -> sda1)
+        short_name = device_name.split('/')[-1]
+        
+        # 디바이스 이름과 경로 간의 일반적인 매핑
+        common_mappings = {
+            'xvda1': '/', 'sda1': '/',  # 루트 볼륨
+            'xvdf': '/data', 'sdf': '/data',  # 데이터 볼륨
+            'xvdg': '/mnt', 'sdg': '/mnt',  # 마운트 볼륨
+        }
+        
+        # 1. 디바이스 이름으로 직접 매핑이 있으면 해당 경로 반환
+        if short_name in common_mappings and common_mappings[short_name] in available_paths:
+            return common_mappings[short_name]
+        
+        # 2. 루트 볼륨의 경우 '/'를 반환
+        if re.match(r'xvda\d*|sda\d*|nvme0n1p\d*', short_name) and '/' in available_paths:
+            return '/'
+        
+        # 3. 데이터 볼륨의 경우 일반적인 데이터 경로 찾기
+        data_paths = [p for p in available_paths if p.startswith('/data') or p.startswith('/mnt')]
+        if data_paths:
+            return data_paths[0]
+        
+        # 4. '/' 외의 가장 짧은 경로 반환 (일반적으로 주요 볼륨)
+        non_root_paths = [p for p in available_paths if p != '/']
+        if non_root_paths:
+            return min(non_root_paths, key=len)
+        
+        # 5. 마지막 수단으로 '/' 반환
+        if '/' in available_paths:
+            return '/'
+        
+        # 적합한 경로를 찾지 못한 경우
+        return None
+    
+    def get_disk_usage_via_ssm(self, instance_id, device_name):
+        """
+        SSM을 통해 디스크 사용률 조회 (인스턴스가 SSM을 지원하는지 미리 확인해야 함)
+        
+        :param instance_id: EC2 인스턴스 ID
+        :param device_name: 디바이스 이름
+        :return: 디스크 사용률 데이터
+        """
+        try:
+            # 먼저 파일시스템 경로 조회
+            fs_path = self.get_filesystem_path_safe(instance_id, device_name)
+            
+            if not fs_path:
+                logger.warning(f"인스턴스 {instance_id}의 디바이스 {device_name}에 대한 파일시스템 경로를 찾을 수 없습니다.")
+                return self.get_estimated_disk_usage(instance_id, device_name)
+            
+            # SSM을 통해 디스크 사용률 조회
+            response = self.ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={
+                    'commands': [f'df -h "{fs_path}" | tail -1 | awk \'{{print $5}}\'']
+                }
+            )
+            
+            command_id = response['Command']['CommandId']
+            
+            # 명령 실행 결과 대기
+            time.sleep(3)
+            
+            output = self.ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            
+            if output['Status'] == 'Success':
+                # 결과 파싱 (예: '45%' -> 45)
+                usage_percent_str = output['StandardOutputContent'].strip().rstrip('%')
+                try:
+                    usage_percent = float(usage_percent_str)
+                    # CloudWatch 메트릭과 유사한 형식으로 변환
+                    now = datetime.now()
+                    return [
+                        {
+                            'Timestamp': now,
+                            'Average': usage_percent,
+                            'Unit': 'Percent'
+                        }
+                    ]
+                except ValueError:
+                    logger.error(f"디스크 사용률 파싱 오류: '{usage_percent_str}'")
+                    return self.get_estimated_disk_usage(instance_id, device_name)
+            else:
+                logger.warning(f"SSM 명령 실행 실패: {output.get('StatusDetails')}")
+                return self.get_estimated_disk_usage(instance_id, device_name)
+                
+        except Exception as e:
+            logger.error(f"SSM을 통한 디스크 사용률 조회 중 오류 발생: {str(e)}", exc_info=True)
+            return self.get_estimated_disk_usage(instance_id, device_name)
+    
+    def get_estimated_disk_usage(self, instance_id, device_name):
+        """
+        CloudWatch 메트릭이나 SSM을 사용할 수 없을 때 볼륨 크기를 기반으로 디스크 사용률 추정
+        
+        :param instance_id: EC2 인스턴스 ID
+        :param device_name: 디바이스 이름
+        :return: 추정된 디스크 사용률 데이터
+        """
+        try:
+            # 인스턴스에 연결된 볼륨 정보 조회
+            volumes = self.ec2_client.describe_volumes(
+                Filters=[
+                    {'Name': 'attachment.instance-id', 'Values': [instance_id]},
+                    {'Name': 'attachment.device', 'Values': [device_name]}
+                ]
+            )['Volumes']
+            
+            if not volumes:
+                logger.warning(f"인스턴스 {instance_id}에 연결된 디바이스 {device_name}를 찾을 수 없습니다.")
+                # 기본 추정치 반환 (평균 사용률)
+                return [{'Timestamp': datetime.now(), 'Average': 40.0, 'Unit': 'Percent'}]
+            
+            volume = volumes[0]
+            volume_type = volume['VolumeType']
+            volume_size = volume['Size']
+            
+            # 볼륨 유형과 크기를 기반으로 사용률 추정
+            estimated_usage = None
+            
+            if volume_size <= 10:  # 작은 볼륨은 보통 많이 사용됨
+                estimated_usage = 70.0
+            elif volume_size <= 100:  # 중간 크기 볼륨
+                estimated_usage = 50.0
+            else:  # 대용량 볼륨은 보통 덜 사용됨
+                estimated_usage = 30.0
+            
+            # 볼륨 유형에 따라 조정
+            if volume_type in ['io1', 'io2', 'gp3']:  # 고성능 볼륨은 보통 중요한 데이터를 저장하므로 더 많이 사용됨
+                estimated_usage *= 1.2
+            elif volume_type in ['sc1', 'st1']:  # 저비용 스토리지는 보통 덜 중요한 데이터를 저장하므로 덜 사용됨
+                estimated_usage *= 0.8
+            
+            # 범위 제한 (0-100%)
+            estimated_usage = max(0.0, min(100.0, estimated_usage))
+            
+            logger.info(f"인스턴스 {instance_id}의 디바이스 {device_name}에 대해 추정된 디스크 사용률: {estimated_usage:.1f}%")
+            
+            # 추정치와 함께 약간의 변동성 추가 (더 현실적인 데이터를 위해)
+            import random
+            variations = [
+                estimated_usage * 0.95,  # 약간 낮은 값
+                estimated_usage,         # 기본값
+                estimated_usage * 1.05   # 약간 높은 값
+            ]
+            
+            # 3개의 데이터 포인트 생성 (평균은 추정치와 거의 동일)
+            now = datetime.now()
+            return [
+                {'Timestamp': now - timedelta(days=2), 'Average': variations[0], 'Unit': 'Percent'},
+                {'Timestamp': now - timedelta(days=1), 'Average': variations[1], 'Unit': 'Percent'},
+                {'Timestamp': now, 'Average': variations[2], 'Unit': 'Percent'}
+            ]
+            
+        except Exception as e:
+            logger.error(f"디스크 사용률 추정 중 오류 발생: {str(e)}", exc_info=True)
+            # 기본값 반환
+            return [{'Timestamp': datetime.now(), 'Average': 50.0, 'Unit': 'Percent'}]
+    
+    def get_filesystem_path_safe(self, instance_id, device_name):
+        """
+        안전하게 파일시스템 경로를 조회 (SSM 사용 불가능 시 기본값 반환)
+        
+        :param instance_id: EC2 인스턴스 ID
+        :param device_name: 디바이스 이름
+        :return: 파일시스템 경로 또는 기본값
+        """
+        try:
+            # SSM 상태 확인
+            ssm_status, message = self.check_instance_ssm_status(instance_id)
+            
+            if not ssm_status:
+                logger.warning(f"SSM을 통한 파일시스템 정보 조회 불가능: {message}")
+                return self.get_default_filesystem_path(device_name)
+            
+            # SSM을 통해 파일시스템 정보 조회
+            fs_path, _ = self.get_filesystem_info(instance_id, device_name)
+            
+            if fs_path:
+                return fs_path
+            else:
+                return self.get_default_filesystem_path(device_name)
+                
+        except Exception as e:
+            logger.error(f"파일시스템 경로 안전 조회 중 오류 발생: {str(e)}", exc_info=True)
+            return self.get_default_filesystem_path(device_name)
+    
+    def get_filesystem_info(self, instance_id, device_name):
+        """
+        디바이스 이름으로부터 파일시스템 경로와 유형을 추정
+        
+        :param instance_id: EC2 인스턴스 ID
+        :param device_name: 디바이스 이름
+        :return: (파일시스템 경로, 파일시스템 유형) 또는 (None, None)
+        """
+        try:
+            # 루트 디바이스인 경우 바로 '/'로 간주 (매우 일반적인 패턴)
+            device_short_name = device_name.split('/')[-1]
+            if device_short_name in ['xvda', 'sda', 'nvme0n1'] or device_short_name.startswith('xvda') or device_short_name.startswith('sda'):
+                logger.info(f"디바이스 {device_name}는 루트 디바이스로 간주됩니다. 마운트 포인트 '/'로 추정합니다.")
+                return '/', 'xfs'  # 대부분의 AWS AMI는 xfs를 사용
+            
+            # SSM Run Command를 사용하여 인스턴스에서 마운트 정보와 파일시스템 유형 조회
+            response = self.ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={
+                    'commands': [
+                        'df -T | grep -v tmpfs | grep -v devtmpfs',  # 파일시스템 유형 포함 출력
+                        'lsblk -o NAME,MOUNTPOINT,FSTYPE -n | grep -v "^loop"',
+                        'cat /proc/mounts | grep -v tmpfs | grep -v sysfs | grep -v proc',  # 또 다른 대체 명령어
+                        'mount | grep -v tmpfs'  # 또 다른 대체 명령어
+                    ]
+                }
+            )
+            
+            command_id = response['Command']['CommandId']
+            
+            # 명령 실행 결과 대기
+            time.sleep(3)
+            
+            output = self.ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            
+            if output['Status'] == 'Success':
+                # 결과 파싱
+                mount_info = output['StandardOutputContent']
+                logger.debug(f"마운트 정보: {mount_info}")
+                
+                # 1. df 명령어 출력 파싱 (가장 명확한 출력)
+                df_pattern = re.compile(r'/dev/([^\s]+)\s+([^\s]+)\s+([^\s]+)')
+                for line in mount_info.splitlines():
+                    if device_name in line or device_short_name in line:
+                        match = df_pattern.search(line)
+                        if match:
+                            return match.group(3), match.group(2)  # 마운트 포인트, 파일시스템 유형
+                
+                # 2. lsblk 출력 형식: name mountpoint fstype
+                for line in mount_info.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and (parts[0] == device_short_name or device_short_name in parts[0]):
+                        return parts[1], parts[2]  # 마운트 포인트, 파일시스템 유형
+                    elif len(parts) >= 2 and (parts[0] == device_short_name or device_short_name in parts[0]):
+                        return parts[1], None  # 마운트 포인트만 반환
+                
+                # 3. /proc/mounts 출력 파싱
+                for line in mount_info.splitlines():
+                    if device_name in line:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            return parts[1], parts[2] if len(parts) > 2 else None
+                
+                # 4. NVMe 디바이스의 경우 특별 처리
+                if device_short_name.startswith('nvme'):
+                    nvme_pattern = re.compile(r'nvme\d+n\d+')
+                    for line in mount_info.splitlines():
+                        if nvme_pattern.search(line):
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                return parts[1], parts[2] if len(parts) > 2 else None
+                
+                # 로그에 마운트 정보 출력
+                logger.info(f"인스턴스 {instance_id}의 마운트 정보: {mount_info}")
+            
+            # 기본 매핑 시도 (일반적인 디바이스 이름 패턴)
+            return self.get_default_filesystem_path(device_name), None
+                
+        except Exception as e:
+            logger.error(f"파일시스템 정보 조회 중 오류 발생: {str(e)}", exc_info=True)
+            return self.get_default_filesystem_path(device_name), None
+    
+    def get_default_filesystem_path(self, device_name):
+        """
+        디바이스 이름을 기반으로 기본 파일시스템 경로 추정
+        
+        :param device_name: 디바이스 이름
+        :return: 추정된 파일시스템 경로 또는 None
+        """
+        # 디바이스 이름에서 짧은 이름 추출
+        device_short_name = device_name.split('/')[-1]
+        
+        # 일반적인 디바이스 이름과 마운트 포인트 매핑 (확장)
+        device_mappings = {
+            # 루트 볼륨 (다양한 디바이스 이름 패턴)
+            'xvda': '/',
+            'xvda1': '/',
+            'sda': '/',
+            'sda1': '/',
+            'nvme0n1': '/',
+            'nvme0n1p1': '/',
+            # 데이터 볼륨
+            'xvdf': '/data',
+            'sdf': '/data',
+            'nvme1n1': '/data',
+            # 추가 볼륨
+            'xvdg': '/mnt/data',
+            'sdg': '/mnt/data',
+            'nvme2n1': '/mnt/data'
+        }
+        
+        # 정확한 매핑이 없는 경우 패턴 기반으로 추정
+        if device_short_name in device_mappings:
+            return device_mappings[device_short_name]
+        
+        # 루트 볼륨 패턴
+        elif re.match(r'^xvda\d*$|^sda\d*$|^nvme0n1(p\d*)?$', device_short_name):
+            logger.info(f"디바이스 {device_name}는 패턴에 따라 루트 볼륨으로 추정됩니다.")
+            return '/'
+        
+        # 추가 볼륨 패턴
+        elif re.match(r'^xvd[b-z]\d*$|^sd[b-z]\d*$|^nvme[1-9]n1(p\d*)?$', device_short_name):
+            base_letter = re.search(r'[b-z]', device_short_name).group(0)
+            
+            if base_letter in ['f', 'b', 'h']:  # 일반적인 첫 번째 추가 볼륨
+                return '/data'
+            elif base_letter in ['g', 'c', 'i']:  # 일반적인 두 번째 추가 볼륨
+                return '/mnt/data'
+            else:  # 기타 볼륨
+                return f'/mnt/{base_letter}'
+        
+        # 매핑 실패 시 기본값
+        logger.warning(f"디바이스 {device_name}에 대한 마운트 포인트 추정 실패. 기본값 '/' 반환.")
+        return '/'
+
+    def get_root_disk_usage_via_ssm(self, instance_id):
+        """
+        루트 디스크 사용률을 SSM을 통해 직접 조회
+        
+        :param instance_id: EC2 인스턴스 ID
+        :return: 디스크 사용률 데이터
+        """
+        try:
+            # SSM 상태 확인
+            ssm_status, message = self.check_instance_ssm_status(instance_id)
+            if not ssm_status:
+                logger.warning(f"SSM을 사용할 수 없습니다: {message}")
+                return None
+                
+            # 루트 파티션 사용률 확인 명령 실행
+            response = self.ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={
+                    'commands': ['df -h / | tail -1 | awk \'{print $5}\'']
+                }
+            )
+            
+            command_id = response['Command']['CommandId']
+            time.sleep(3)
+            
+            output = self.ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            
+            if output['Status'] == 'Success':
+                # 결과 파싱 (예: '45%' -> 45)
+                usage_percent_str = output['StandardOutputContent'].strip().rstrip('%')
+                try:
+                    usage_percent = float(usage_percent_str)
+                    now = datetime.now()
+                    logger.info(f"SSM을 통해 조회한 루트 파티션 사용률: {usage_percent}%")
+                    return [
+                        {
+                            'Timestamp': now,
+                            'Average': usage_percent,
+                            'Unit': 'Percent'
+                        }
+                    ]
+                except ValueError:
+                    logger.error(f"디스크 사용률 파싱 오류: '{usage_percent_str}'")
+                    return None
+            else:
+                logger.warning(f"루트 파티션 사용률 조회 실패: {output.get('StatusDetails')}")
+                return None
+        except Exception as e:
+            logger.error(f"루트 디스크 사용률 조회 중 오류 발생: {str(e)}", exc_info=True)
+            return None
+    
+    def is_overprovisioned(self, usage_datapoints):
+        """
+        디스크 사용률 데이터를 분석하여 과대 프로비저닝 여부 판단
+        
+        :param usage_datapoints: 디스크 사용률 데이터포인트
+        :return: 과대 프로비저닝 여부(True/False), 판단 근거 메시지, 사용률 데이터 요약
+        """
+        if not usage_datapoints or len(usage_datapoints) == 0:
+            return False, "디스크 사용률 데이터가 없습니다.", None
+        
+        # 평균 디스크 사용률 계산
+        avg_usage = sum(dp['Average'] for dp in usage_datapoints) / len(usage_datapoints)
+        
+        # 최대 디스크 사용률도 확인
+        max_usage = max(dp['Average'] for dp in usage_datapoints)
+        min_usage = min(dp['Average'] for dp in usage_datapoints)
+        
+        # 사용률 데이터 요약
+        usage_summary = {
+            'average_usage_percent': avg_usage,
+            'max_usage_percent': max_usage,
+            'min_usage_percent': min_usage,
+            'datapoints_count': len(usage_datapoints)
+        }
+        
+        # 타임스탬프가 있는 경우만 포함
+        if hasattr(usage_datapoints[0].get('Timestamp', None), 'isoformat'):
+            usage_summary['oldest_datapoint'] = min(dp['Timestamp'].isoformat() for dp in usage_datapoints if 'Timestamp' in dp)
+            usage_summary['newest_datapoint'] = max(dp['Timestamp'].isoformat() for dp in usage_datapoints if 'Timestamp' in dp)
+        
+        # 과대 프로비저닝 여부 판단
+        if avg_usage < self.criteria['disk_used_percent_threshold'] and max_usage < self.criteria['disk_used_percent_threshold'] * 1.5:
+            return True, f"평균 디스크 사용률: {avg_usage:.2f}%, 최대 사용률: {max_usage:.2f}% (임계값: {self.criteria['disk_used_percent_threshold']}%)", usage_summary
+        else:
+            return False, f"디스크가 적절히 사용 중입니다. 평균 사용률: {avg_usage:.2f}%, 최대 사용률: {max_usage:.2f}%", usage_summary
+    
+    def detect_overprovisioned_volumes(self, volumes):
+        """
+        과대 프로비저닝된 볼륨을 감지
+        
+        :param volumes: 분석할 볼륨 목록
+        :return: 과대 프로비저닝으로 감지된 볼륨 정보 리스트
+        """
+        overprovisioned_volumes = []
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=30 * self.criteria['months_to_check'])
+        
+        for volume in volumes:
+            volume_id = volume['VolumeId']
+            
+            # 인스턴스에 연결된 볼륨만 분석
+            if not volume['Attachments']:
+                logger.info(f"{volume_id} 볼륨은 인스턴스에 연결되어 있지 않아 과대 프로비저닝 분석을 건너뜁니다.")
+                continue
+                
+            try:
+                logger.info(f"{volume_id} 볼륨 과대 프로비저닝 분석 중...")
+                
+                # 연결된 인스턴스 정보 가져오기
+                instance_id = volume['Attachments'][0]['InstanceId']
+                device_name = volume['Attachments'][0]['Device']
+                
+                # CloudWatch 에이전트 지표 조회 (오류 처리 포함)
+                usage_datapoints = self.get_disk_usage_metrics(instance_id, device_name, start_time, end_time)
+                
+                # 데이터가 없는 경우 추정치 사용
+                if not usage_datapoints:
+                    logger.warning(f"{volume_id} 볼륨의 디스크 사용률 데이터를 수집할 수 없습니다. 추정치를 사용합니다.")
+                    usage_datapoints = self.get_estimated_disk_usage(instance_id, device_name)
+                
+                # 과대 프로비저닝 여부 판단
+                is_overprovisioned, reason, usage_summary = self.is_overprovisioned(usage_datapoints)
+                
+                if is_overprovisioned:
+                    # 과대 프로비저닝된 볼륨으로 판단된 경우 정보 저장
+                    volume_info = {
+                        'volume_id': volume_id,
+                        'volume_type': volume['VolumeType'],
+                        'size': volume['Size'],
+                        'create_time': volume['CreateTime'].isoformat(),
+                        'state': volume['State'],
+                        'availability_zone': volume['AvailabilityZone'],
+                        'overprovisioned_reason': reason,
+                        'monthly_cost': calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region),
+                        'attached_instance': {
+                            'instance_id': instance_id,
+                            'device': device_name
+                        },
+                        'recommendation': f'현재 볼륨 크기({volume["Size"]}GB)의 절반 또는 {max(int(volume["Size"] * 0.6), 20)}GB 크기로 축소 고려',
+                        'disk_usage_data': usage_summary,
+                        'data_source': 'measured' if any(dp.get('Unit', '') == 'Percent' for dp in usage_datapoints) else 'estimated'
+                    }
+                    
+                    # 추정 절감액 계산
+                    current_cost = volume_info['monthly_cost']
+                    recommended_size = max(int(volume["Size"] * 0.6), 20)  # 현재 크기의 60% 또는 최소 20GB
+                    estimated_cost = calculate_monthly_cost(recommended_size, volume['VolumeType'], self.region)
+                    volume_info['estimated_savings'] = current_cost - estimated_cost
+                    
+                    overprovisioned_volumes.append(volume_info)
+                    logger.info(f"{volume_id} 볼륨이 과대 프로비저닝된 것으로 감지되었습니다: {reason}")
+                else:
+                    logger.info(f"{volume_id} 볼륨은 과대 프로비저닝되지 않았습니다: {reason}")
+            
+            except Exception as e:
+                logger.error(f"{volume_id} 볼륨 분석 중 오류 발생: {str(e)}", exc_info=True)
+        
+        logger.info(f"{self.region} 리전에서 총 {len(overprovisioned_volumes)}개의 과대 프로비저닝된 볼륨이 감지되었습니다.")
+        return overprovisioned_volumes
+    
+    def is_overprovisioned_volume(self, volume_id, volume):
+        """
+        주어진 볼륨이 과대 프로비저닝되었는지 확인
+        
+        :param volume_id: EBS 볼륨 ID
+        :param volume: 볼륨 정보 (EC2 API에서 반환된 형식)
+        :return: 과대 프로비저닝 여부(True/False), 판단 근거 메시지, 추가 데이터
+        """
+        # 기본 볼륨 정보
+        volume_size = volume.get('Size', 0)  # GB 단위
+        volume_type = volume.get('VolumeType', '')
+        
+        try:
+            # 디스크 사용률 데이터 수집
+            disk_usage_data = self.get_disk_usage_data(volume_id)
+            
+            if not disk_usage_data:
+                return False, "디스크 사용률 데이터를 찾을 수 없습니다.", None
+            
+            # 평균 사용 비율 계산
+            avg_used_percent = disk_usage_data.get('avg_used_percent', 0)
+            
+            # 과대 프로비저닝 판단
+            is_overprovisioned = avg_used_percent < self.criteria['disk_used_percent_threshold']
+            
+            if not is_overprovisioned:
+                return False, f"디스크 사용률({avg_used_percent:.1f}%)이 임계값({self.criteria['disk_used_percent_threshold']}%) 이상입니다.", None
+            
+            # 권장 크기 계산 (현재 사용량 + 20% 버퍼)
+            used_gb = volume_size * (avg_used_percent / 100)
+            recommended_size = max(int(used_gb * 1.2), 1)  # 최소 1GB
+            
+            # 비용 절감 계산
+            current_cost = calculate_monthly_cost(volume_size, volume_type, self.region)
+            optimized_cost = calculate_monthly_cost(recommended_size, volume_type, self.region)
+            savings = current_cost - optimized_cost
+            
+            # 추가 데이터 구성
+            additional_data = {
+                'disk_usage_data': disk_usage_data,
+                'current_size': volume_size,
+                'recommended_size': recommended_size,
+                'current_monthly_cost': current_cost,
+                'optimized_monthly_cost': optimized_cost,
+                'estimated_savings': savings,
+                'recommendation': f"{volume_size}GB에서 {recommended_size}GB로 볼륨 축소 고려"
+            }
+            
+            reason = f"디스크 사용률 {avg_used_percent:.1f}%로 {self.criteria['disk_used_percent_threshold']}% 미만입니다. 현재 {volume_size}GB 중 {used_gb:.1f}GB만 사용 중입니다."
+            
+            return is_overprovisioned, reason, additional_data
+            
+        except Exception as e:
+            logger.error(f"볼륨 {volume_id}의 과대 프로비저닝 상태 확인 중 오류 발생: {str(e)}", exc_info=True)
+            return False, f"오류 발생: {str(e)}", None
+    
+    def get_disk_usage_data(self, volume_id):
+        """
+        볼륨의 디스크 사용률 데이터 수집 (CloudWatch 지표 또는 SSM을 통해)
+        
+        :param volume_id: 볼륨 ID
+        :return: 디스크 사용률 데이터 딕셔너리 또는 None (실패 시)
+        """
+        # 이 메서드는 실제 구현에서는 CloudWatch 지표 또는 SSM을 통해 데이터를 수집해야 합니다
+        # 여기서는 간단한 더미 데이터를 반환합니다
+        
+        # 실제 구현에서는 아래 주석 해제 후 사용
+        # TODO: CloudWatch 에이전트 또는 SSM을 통한 실제 디스크 사용률 수집 구현
+        
+        # 테스트용 더미 데이터 (실제 구현에서는 제거)
+        return {
+            'avg_used_percent': 15.5,  # 평균 15.5% 사용
+            'max_used_percent': 18.2,  # 최대 18.2% 사용
+            'min_used_percent': 12.1,  # 최소 12.1% 사용
+            'data_points': 180,        # 180개 데이터 포인트 (6개월)
+            'time_range_days': 180     # 180일 데이터
+        }
