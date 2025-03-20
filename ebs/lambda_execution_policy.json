@@ -9,24 +9,13 @@
         "ec2:DescribeVolumeStatus",
         "ec2:DescribeInstances",
         "ec2:DescribeTags",
+        "s3:PutObject",
+        "ec2:CreateSnapshot",
+        "ec2:CreateSnapshots",
+        "ec2:CreateTags",
         "ec2:DescribeSnapshots"
       ],
       "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateSnapshot",
-        "ec2:DeleteVolume",
-        "ec2:DetachVolume",
-        "ec2:AttachVolume",
-        "ec2:CreateTags"
-      ],
-      "Resource": [
-        "arn:aws:ec2:*:*:volume/*",
-        "arn:aws:ec2:*:*:snapshot/*",
-        "arn:aws:ec2:*:*:instance/*"
-      ]
     },
     {
       "Effect": "Allow",

@@ -35,6 +35,14 @@ class RecommendationExecutor:
             'details': {}
         }
         
+        # 유효한 작업 유형 확인
+        valid_idle_actions = ['snapshot_and_delete', 'snapshot_only', 'change_type', 'change_type_and_resize']
+        if action_type not in valid_idle_actions:
+            error_msg = f"유휴 볼륨에 지원되지 않는 작업 유형: {action_type}. 유효한 작업: {valid_idle_actions}"
+            logger.error(error_msg)
+            result['details']['error'] = error_msg
+            return result
+            
         logger.info(f"볼륨 {volume_id}에 대한 '{action_type}' 작업 실행 중...")
         
         try:
@@ -87,6 +95,10 @@ class RecommendationExecutor:
             elif action_type == 'change_type':
                 # 향후 확장: 볼륨 타입 변경 로직 구현
                 result['details']['error'] = "볼륨 타입 변경 기능은 아직 구현되지 않았습니다."
+                
+            elif action_type == 'change_type_and_resize':
+                # 향후 확장: 볼륨 타입 변경 및 크기 조정 로직 구현
+                result['details']['error'] = "볼륨 타입 변경 및 크기 조정 기능은 아직 구현되지 않았습니다."
             
             else:
                 result['details']['error'] = f"지원되지 않는 작업 유형: {action_type}"
@@ -117,10 +129,45 @@ class RecommendationExecutor:
             'details': {}
         }
         
+        # 유효한 작업 유형 확인
+        valid_overprovisioned_actions = ['resize', 'change_type', 'change_type_and_resize']
+        if action_type not in valid_overprovisioned_actions:
+            error_msg = f"과대 프로비저닝 볼륨에 지원되지 않는 작업 유형: {action_type}. 유효한 작업: {valid_overprovisioned_actions}"
+            logger.error(error_msg)
+            result['details']['error'] = error_msg
+            return result
+            
         logger.info(f"볼륨 {volume_id}에 대한 '{action_type}' 작업 실행 중...")
         
-        # 현재는 구현되지 않음 - 향후 확장 예정
-        result['details']['error'] = "과대 프로비저닝된 볼륨 최적화 기능은 아직 구현되지 않았습니다."
+        try:
+            # 스냅샷 생성 (안전을 위해)
+            tags = {'Name': f"Overprovisioned-{volume_id}", 'AutoCreated': 'true', 'Source': 'EBS-Optimizer'}
+            
+            if 'name' in volume_info:
+                tags['SourceName'] = volume_info['name']
+            
+            snapshot_id = self.ebs_action_executor.create_snapshot(
+                volume_id,
+                description=f"Overprovisioned volume snapshot before {action_type} - {datetime.now().strftime('%Y-%m-%d')}",
+                tags=tags
+            )
+            
+            if snapshot_id:
+                result['details']['snapshot_id'] = snapshot_id
+            
+            # 작업 유형에 따른 처리
+            if action_type == 'resize':
+                result['details']['error'] = "볼륨 크기 조정 기능은 아직 구현되지 않았습니다."
+                
+            elif action_type == 'change_type':
+                result['details']['error'] = "볼륨 타입 변경 기능은 아직 구현되지 않았습니다."
+                
+            elif action_type == 'change_type_and_resize':
+                result['details']['error'] = "볼륨 타입 변경 및 크기 조정 기능은 아직 구현되지 않았습니다."
+                
+        except Exception as e:
+            logger.error(f"권장 조치 실행 중 오류 발생: {str(e)}", exc_info=True)
+            result['details']['error'] = str(e)
         
         # 실행 기록 저장
         self.execution_history.append(result)
