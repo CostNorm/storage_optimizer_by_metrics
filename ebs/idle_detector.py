@@ -78,12 +78,34 @@ class IdleVolumeDetector:
         reasons = []
         metrics_summary = {}
         
+        # 볼륨 상태 확인
+        try:
+            volume_response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
+            volume_state = volume_response['Volumes'][0]['State'] if volume_response['Volumes'] else None
+            
+            # 'available' 상태는 볼륨이 어떤 인스턴스에도 연결되지 않았음을 의미
+            if volume_state == 'available':
+                reasons.append(f"볼륨이 'available' 상태로 어떤 인스턴스에도 연결되어 있지 않음")
+                metrics_summary['volume_state'] = {'state': 'available'}
+                return True, "볼륨이 어떤 인스턴스에도 연결되어 있지 않습니다.", metrics_summary
+        except Exception as e:
+            logger.warning(f"볼륨 {volume_id}의 상태 확인 중 오류 발생: {str(e)}")
+        
         # 필수 지표가 없는 경우 (지표가 없는 것은 볼륨이 사용되지 않는다는 강한 증거)
         required_metrics = ['VolumeIdleTime', 'VolumeReadOps', 'VolumeWriteOps']
         missing_metrics = [m for m in required_metrics if m not in metrics]
         
         if missing_metrics:
-            return False, f"일부 필수 지표({', '.join(missing_metrics)})가 누락되어 분석할 수 없습니다.", None
+            # 메트릭이 없는 것을 유휴 상태의 증거로 취급
+            if not metrics or len(metrics) == 0:
+                reasons.append("모든 CloudWatch 메트릭 데이터가 없음 (볼륨이 사용되지 않았거나 최근에 생성됨)")
+                return True, "모든 CloudWatch 메트릭 데이터가 없어 볼륨이 사용되지 않는 것으로 판단됩니다.", {'missing_metrics': required_metrics}
+            elif len(missing_metrics) == len(required_metrics):
+                reasons.append(f"모든 필수 메트릭({', '.join(missing_metrics)})이 누락됨 (볼륨이 사용되지 않음)")
+                return True, f"모든 필수 메트릭({', '.join(missing_metrics)})이 누락되어 볼륨이 사용되지 않는 것으로 판단됩니다.", {'missing_metrics': missing_metrics}
+            else:
+                # 일부 메트릭만 누락된 경우 계속 분석 진행
+                logger.info(f"볼륨 {volume_id}에서 일부 필수 메트릭({', '.join(missing_metrics)})이 누락되었지만 분석을 계속합니다.")
         
         # 지표 형식 확인 및 처리
         is_new_format = isinstance(metrics.get('VolumeIdleTime'), dict) and 'latest' in metrics.get('VolumeIdleTime', {})
@@ -215,6 +237,33 @@ class IdleVolumeDetector:
             
             try:
                 logger.info(f"{volume_id} 볼륨 유휴 상태 분석 중...")
+                
+                # 볼륨이 'available' 상태인지 먼저 확인 (어떤 인스턴스에도 연결되지 않음)
+                if volume['State'] == 'available':
+                    logger.info(f"{volume_id} 볼륨이 'available' 상태로, 자동으로 유휴 상태로 감지됩니다.")
+                    
+                    # 유휴 볼륨으로 판단된 경우 정보 저장
+                    volume_info = {
+                        'volume_id': volume_id,
+                        'volume_type': volume['VolumeType'],
+                        'size': volume['Size'],
+                        'create_time': volume['CreateTime'].isoformat(),
+                        'state': volume['State'],
+                        'availability_zone': volume['AvailabilityZone'],
+                        'idle_reason': "볼륨이 어떤 인스턴스에도 연결되어 있지 않습니다.",
+                        'monthly_cost': calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region),
+                        'attached_instances': [],
+                        'metrics_summary': {'volume_state': {'state': 'available'}}
+                    }
+                    
+                    # 권장 조치 추가
+                    if volume['VolumeType'] in ['io1', 'io2']:
+                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 gp3로 변경 고려'
+                    else:
+                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 필요 최소 크기로 축소 고려'
+                    
+                    idle_volumes.append(volume_info)
+                    continue  # 다음 볼륨으로 넘어감
                 
                 # CloudWatch 지표 수집
                 metrics = self.get_volume_metrics(volume_id, start_time, end_time)
