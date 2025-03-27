@@ -1,9 +1,9 @@
 import logging
 import boto3
-import time
 import re
+import time
 from datetime import datetime, timedelta
-from utils import calculate_monthly_cost
+from ..utils.utils import calculate_monthly_cost
 
 logger = logging.getLogger()
 
@@ -654,9 +654,9 @@ class OverprovisionedVolumeDetector:
                     usage_datapoints = self.get_estimated_disk_usage(instance_id, device_name)
                 
                 # 과대 프로비저닝 여부 판단
-                is_overprovisioned, reason, usage_summary = self.is_overprovisioned(usage_datapoints)
+                is_over, reason, usage_summary = self.is_overprovisioned(usage_datapoints)
                 
-                if is_overprovisioned:
+                if is_over:
                     # 과대 프로비저닝된 볼륨으로 판단된 경우 정보 저장
                     volume_info = {
                         'volume_id': volume_id,
@@ -666,26 +666,43 @@ class OverprovisionedVolumeDetector:
                         'state': volume['State'],
                         'availability_zone': volume['AvailabilityZone'],
                         'overprovisioned_reason': reason,
-                        'monthly_cost': calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region),
-                        'attached_instance': {
-                            'instance_id': instance_id,
-                            'device': device_name
-                        },
-                        'recommendation': f'현재 볼륨 크기({volume["Size"]}GB)의 절반 또는 {max(int(volume["Size"] * 0.6), 20)}GB 크기로 축소 고려',
+                        'device': device_name,
+                        'instance_id': instance_id,
                         'disk_usage_data': usage_summary,
-                        'data_source': 'measured' if any(dp.get('Unit', '') == 'Percent' for dp in usage_datapoints) else 'estimated'
+                        'monthly_cost': calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region)
                     }
                     
-                    # 추정 절감액 계산
-                    current_cost = volume_info['monthly_cost']
-                    recommended_size = max(int(volume["Size"] * 0.6), 20)  # 현재 크기의 60% 또는 최소 20GB
-                    estimated_cost = calculate_monthly_cost(recommended_size, volume['VolumeType'], self.region)
-                    volume_info['estimated_savings'] = current_cost - estimated_cost
+                    # 연결된 인스턴스 정보 추가
+                    volume_info['attached_instances'] = [{
+                        'instance_id': attachment['InstanceId'],
+                        'attach_time': attachment['AttachTime'].isoformat(),
+                        'device': attachment['Device']
+                    } for attachment in volume['Attachments']]
+                    
+                    # 권장 조치 추가
+                    if volume['VolumeType'] in ['io1', 'io2']:
+                        # 프로비저닝된 IOPS 볼륨은 gp3로 변경 권장
+                        volume_info['recommendation'] = '과대 프로비저닝 상태입니다. gp3 볼륨 유형으로 전환 고려'
+                        # 예상 절감액 계산
+                        current_cost = volume_info['monthly_cost']
+                        gp3_cost = calculate_monthly_cost(volume['Size'], 'gp3', self.region)
+                        savings = current_cost - gp3_cost
+                        volume_info['estimated_savings'] = savings
+                    else:
+                        # 일반 볼륨은 크기 축소 권장
+                        recommended_size = self.recommend_volume_size(usage_summary, volume['Size'])
+                        volume_info['recommendation'] = f'과대 프로비저닝 상태입니다. 볼륨 크기를 {recommended_size}GB로 축소 고려'
+                        # 예상 절감액 계산
+                        current_cost = volume_info['monthly_cost']
+                        reduced_cost = calculate_monthly_cost(recommended_size, volume['VolumeType'], self.region)
+                        savings = current_cost - reduced_cost
+                        volume_info['estimated_savings'] = savings
+                        volume_info['recommended_size'] = recommended_size
                     
                     overprovisioned_volumes.append(volume_info)
-                    logger.info(f"{volume_id} 볼륨이 과대 프로비저닝된 것으로 감지되었습니다: {reason}")
+                    logger.info(f"{volume_id} 볼륨이 과대 프로비저닝 상태로 감지되었습니다: {reason}")
                 else:
-                    logger.info(f"{volume_id} 볼륨은 과대 프로비저닝되지 않았습니다: {reason}")
+                    logger.info(f"{volume_id} 볼륨은 과대 프로비저닝 상태가 아닙니다: {reason}")
             
             except Exception as e:
                 logger.error(f"{volume_id} 볼륨 분석 중 오류 발생: {str(e)}", exc_info=True)
@@ -693,80 +710,131 @@ class OverprovisionedVolumeDetector:
         logger.info(f"{self.region} 리전에서 총 {len(overprovisioned_volumes)}개의 과대 프로비저닝된 볼륨이 감지되었습니다.")
         return overprovisioned_volumes
     
+    def recommend_volume_size(self, usage_summary, current_size):
+        """
+        디스크 사용률을 기반으로 권장 볼륨 크기 계산
+        
+        :param usage_summary: 디스크 사용 요약 정보
+        :param current_size: 현재 볼륨 크기(GB)
+        :return: 권장 볼륨 크기(GB)
+        """
+        if not usage_summary or 'average_usage_percent' not in usage_summary:
+            # 데이터가 없으면 현재 크기의 75%로 권장
+            return max(4, int(current_size * 0.75))
+        
+        # 사용률에 기반한 필요 크기 계산
+        usage_percent = usage_summary['average_usage_percent']
+        
+        # 이론적 필요 크기
+        theoretical_size = current_size * (usage_percent / 100)
+        
+        # 최대 사용률도 고려
+        if 'max_usage_percent' in usage_summary:
+            max_usage_percent = usage_summary['max_usage_percent']
+            # 최대 사용률에 기반한 크기
+            max_usage_size = current_size * (max_usage_percent / 100)
+            # 안전 마진(20%)을 추가하여 이론적 필요 크기와 비교해 더 큰 값 선택
+            theoretical_size = max(theoretical_size, max_usage_size * 1.2)
+        else:
+            # 최대 사용률 정보가 없는 경우 안전 마진 추가
+            theoretical_size *= 1.3  # 30% 안전 마진
+        
+        # 앞으로의 추가 사용량을 위한 버퍼 추가 (최소 10%, 최대 30%)
+        growth_buffer = min(max(theoretical_size * 0.1, 1), theoretical_size * 0.3)
+        
+        # 권장 크기 = 이론적 필요 크기 + 성장 버퍼, 최소 4GB
+        recommended_size = max(4, int(theoretical_size + growth_buffer + 0.5))  # 0.5 추가하여 반올림
+        
+        # Amazon EBS 볼륨은 일반적으로 1GB 단위로 제공되므로 위로 반올림
+        if recommended_size < current_size:
+            # 최소 20% 절약이 되어야 의미 있음
+            if recommended_size <= current_size * 0.8:
+                return recommended_size
+            else:
+                return current_size
+        else:
+            # 계산된 권장 크기가 현재 크기보다 크면 현재 크기 유지
+            return current_size
+    
     def is_overprovisioned_volume(self, volume_id, volume):
         """
-        주어진 볼륨이 과대 프로비저닝되었는지 확인
-        
-        :param volume_id: EBS 볼륨 ID
-        :param volume: 볼륨 정보 (EC2 API에서 반환된 형식)
-        :return: 과대 프로비저닝 여부(True/False), 판단 근거 메시지, 추가 데이터
-        """
-        # 기본 볼륨 정보
-        volume_size = volume.get('Size', 0)  # GB 단위
-        volume_type = volume.get('VolumeType', '')
-        
-        try:
-            # 디스크 사용률 데이터 수집
-            disk_usage_data = self.get_disk_usage_data(volume_id)
-            
-            if not disk_usage_data:
-                return False, "디스크 사용률 데이터를 찾을 수 없습니다.", None
-            
-            # 평균 사용 비율 계산
-            avg_used_percent = disk_usage_data.get('avg_used_percent', 0)
-            
-            # 과대 프로비저닝 판단
-            is_overprovisioned = avg_used_percent < self.criteria['disk_used_percent_threshold']
-            
-            if not is_overprovisioned:
-                return False, f"디스크 사용률({avg_used_percent:.1f}%)이 임계값({self.criteria['disk_used_percent_threshold']}%) 이상입니다.", None
-            
-            # 권장 크기 계산 (현재 사용량 + 20% 버퍼)
-            used_gb = volume_size * (avg_used_percent / 100)
-            recommended_size = max(int(used_gb * 1.2), 1)  # 최소 1GB
-            
-            # 비용 절감 계산
-            current_cost = calculate_monthly_cost(volume_size, volume_type, self.region)
-            optimized_cost = calculate_monthly_cost(recommended_size, volume_type, self.region)
-            savings = current_cost - optimized_cost
-            
-            # 추가 데이터 구성
-            additional_data = {
-                'disk_usage_data': disk_usage_data,
-                'current_size': volume_size,
-                'recommended_size': recommended_size,
-                'current_monthly_cost': current_cost,
-                'optimized_monthly_cost': optimized_cost,
-                'estimated_savings': savings,
-                'recommendation': f"{volume_size}GB에서 {recommended_size}GB로 볼륨 축소 고려"
-            }
-            
-            reason = f"디스크 사용률 {avg_used_percent:.1f}%로 {self.criteria['disk_used_percent_threshold']}% 미만입니다. 현재 {volume_size}GB 중 {used_gb:.1f}GB만 사용 중입니다."
-            
-            return is_overprovisioned, reason, additional_data
-            
-        except Exception as e:
-            logger.error(f"볼륨 {volume_id}의 과대 프로비저닝 상태 확인 중 오류 발생: {str(e)}", exc_info=True)
-            return False, f"오류 발생: {str(e)}", None
-    
-    def get_disk_usage_data(self, volume_id):
-        """
-        볼륨의 디스크 사용률 데이터 수집 (CloudWatch 지표 또는 SSM을 통해)
+        특정 볼륨이 과대 프로비저닝되었는지 확인
         
         :param volume_id: 볼륨 ID
-        :return: 디스크 사용률 데이터 딕셔너리 또는 None (실패 시)
+        :param volume: 볼륨 정보 딕셔너리
+        :return: (과대 프로비저닝 여부, 이유, 추가 데이터)
         """
-        # 이 메서드는 실제 구현에서는 CloudWatch 지표 또는 SSM을 통해 데이터를 수집해야 합니다
-        # 여기서는 간단한 더미 데이터를 반환합니다
-        
-        # 실제 구현에서는 아래 주석 해제 후 사용
-        # TODO: CloudWatch 에이전트 또는 SSM을 통한 실제 디스크 사용률 수집 구현
-        
-        # 테스트용 더미 데이터 (실제 구현에서는 제거)
-        return {
-            'avg_used_percent': 15.5,  # 평균 15.5% 사용
-            'max_used_percent': 18.2,  # 최대 18.2% 사용
-            'min_used_percent': 12.1,  # 최소 12.1% 사용
-            'data_points': 180,        # 180개 데이터 포인트 (6개월)
-            'time_range_days': 180     # 180일 데이터
-        }
+        try:
+            # 볼륨이 인스턴스에 연결되어 있는지 확인
+            if not volume['Attachments']:
+                logger.info(f"볼륨 {volume_id}가 인스턴스에 연결되어 있지 않아 과대 프로비저닝 검사를 수행하지 않습니다.")
+                return False, "볼륨이 인스턴스에 연결되어 있지 않습니다.", None
+            
+            # 크기가 작은 볼륨은 과대 프로비저닝 검사에서 제외할 수 있음
+            min_size_gb = self.criteria.get('min_size_gb', 0)
+            if min_size_gb > 0 and volume.get('Size', 0) < min_size_gb:
+                logger.info(f"볼륨 {volume_id}의 크기가 {volume.get('Size')}GB로, 최소 검사 크기인 {min_size_gb}GB보다 작아 검사를 생략합니다.")
+                return False, f"볼륨 크기({volume.get('Size')}GB)가 최소 검사 크기({min_size_gb}GB)보다 작습니다.", None
+            
+            # 연결된 인스턴스 정보
+            instance_id = volume['Attachments'][0]['InstanceId']
+            device_name = volume['Attachments'][0]['Device']
+            
+            logger.info(f"볼륨 {volume_id} (크기: {volume.get('Size')}GB)가 인스턴스 {instance_id}에 {device_name}로 연결됨")
+            
+            # 디스크 사용률 데이터 수집
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=30 * self.criteria['months_to_check'])
+            usage_datapoints = self.get_disk_usage_metrics(instance_id, device_name, start_time, end_time)
+            
+            # 데이터가 없는 경우 추정치 사용
+            if not usage_datapoints or len(usage_datapoints) == 0:
+                logger.warning(f"볼륨 {volume_id}의 디스크 사용률 데이터를 수집할 수 없습니다. 추정치를 사용합니다.")
+                usage_datapoints = self.get_estimated_disk_usage(instance_id, device_name)
+                logger.info(f"볼륨 {volume_id}에 대한 추정 사용률 데이터: {usage_datapoints}")
+            else:
+                logger.info(f"볼륨 {volume_id}에 대한 수집된 사용률 데이터: {usage_datapoints}")
+            
+            # 과대 프로비저닝 여부 판단
+            is_over, reason, usage_summary = self.is_overprovisioned(usage_datapoints)
+            
+            # 과대 프로비저닝 여부, 이유, 그리고 추가 정보 반환
+            additional_data = {}
+            if is_over:
+                # 현재 볼륨 정보
+                additional_data['volume_type'] = volume['VolumeType']
+                additional_data['size'] = volume['Size']
+                
+                # 권장 크기 계산
+                recommended_size = self.recommend_volume_size(usage_summary, volume['Size'])
+                additional_data['recommended_size'] = recommended_size
+                
+                # 예상 절감액 계산
+                current_cost = calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region)
+                
+                # io1/io2 볼륨이면 gp3로 변환 추천
+                if volume['VolumeType'] in ['io1', 'io2']:
+                    gp3_cost = calculate_monthly_cost(volume['Size'], 'gp3', self.region)
+                    savings = current_cost - gp3_cost
+                    additional_data['recommended_type'] = 'gp3'
+                    additional_data['estimated_savings'] = savings
+                    additional_data['recommendation'] = '과대 프로비저닝 상태입니다. gp3 볼륨 유형으로 전환 고려'
+                else:
+                    # 크기 축소 추천
+                    reduced_cost = calculate_monthly_cost(recommended_size, volume['VolumeType'], self.region)
+                    savings = current_cost - reduced_cost
+                    additional_data['estimated_savings'] = savings
+                    additional_data['recommendation'] = f'과대 프로비저닝 상태입니다. 볼륨 크기를 {recommended_size}GB로 축소 고려'
+                
+                # 디스크 사용률 데이터 추가
+                additional_data['disk_usage_data'] = usage_summary
+            else:
+                # 상세 진단 정보 추가
+                additional_data['disk_usage_data'] = usage_summary
+                logger.info(f"볼륨 {volume_id}는 과대 프로비저닝 상태가 아닙니다: {reason}")
+            
+            return is_over, reason, additional_data
+            
+        except Exception as e:
+            logger.error(f"볼륨 {volume_id} 과대 프로비저닝 확인 중 오류 발생: {str(e)}", exc_info=True)
+            return False, f"분석 오류: {str(e)}", None

@@ -2,10 +2,10 @@ import boto3
 import logging
 from datetime import datetime, timedelta
 
-from idle_detector import IdleVolumeDetector
-from overprovisioned_detector import OverprovisionedVolumeDetector
-from config import IDLE_VOLUME_CRITERIA, OVERPROVISIONED_CRITERIA, METRIC_PERIOD
-from utils import calculate_monthly_cost, get_tags_as_dict
+from .idle_detector import IdleVolumeDetector
+from .overprovisioned_detector import OverprovisionedVolumeDetector
+from ..utils.config import IDLE_VOLUME_CRITERIA, OVERPROVISIONED_CRITERIA, METRIC_PERIOD
+from ..utils.utils import calculate_monthly_cost, get_tags_as_dict
 
 logger = logging.getLogger()
 
@@ -301,6 +301,12 @@ class EBSAnalyzer:
             is_idle, reason, metrics_summary = self.idle_detector.is_idle_volume(volume_id, metrics)
             
             volume_info['is_idle'] = is_idle
+            volume_info['idle_check_details'] = {
+                'result': is_idle,
+                'reason': reason,
+                'metrics_summary': metrics_summary
+            }
+            
             if is_idle:
                 volume_info['idle_reason'] = reason
                 volume_info['metrics_summary'] = metrics_summary
@@ -316,6 +322,12 @@ class EBSAnalyzer:
                 is_overprovisioned, over_reason, over_data = self.overprovisioned_detector.is_overprovisioned_volume(volume_id, volume)
                 
                 volume_info['is_overprovisioned'] = is_overprovisioned
+                volume_info['overprovisioned_check_details'] = {
+                    'result': is_overprovisioned, 
+                    'reason': over_reason,
+                    'additional_data': over_data
+                }
+                
                 if is_overprovisioned:
                     volume_info['overprovisioned_reason'] = over_reason
                     if over_data:
@@ -323,8 +335,16 @@ class EBSAnalyzer:
             except Exception as e:
                 logger.warning(f"볼륨 {volume_id}의 과대 프로비저닝 상태 확인 중 오류 발생: {str(e)}")
                 volume_info['is_overprovisioned'] = False
+                volume_info['overprovisioned_check_error'] = str(e)
             
-            logger.info(f"볼륨 {volume_id} 분석 완료 - 유휴 상태: {volume_info['is_idle']}, 과대 프로비저닝: {volume_info['is_overprovisioned']}")
+            # 결과 요약
+            if volume_info['is_idle'] or volume_info['is_overprovisioned']:
+                volume_info['status'] = '최적화 필요'
+            else:
+                volume_info['status'] = '최적 상태'
+                volume_info['recommendation'] = '해당 없음'
+            
+            logger.info(f"볼륨 {volume_id} 분석 완료 - 유휴 상태: {volume_info['is_idle']}, 과대 프로비저닝: {volume_info['is_overprovisioned']}, 상태: {volume_info['status']}")
             
             return volume_info
             

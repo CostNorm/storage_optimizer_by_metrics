@@ -3,7 +3,7 @@ import json
 import time
 import boto3
 from datetime import datetime
-from actions.ebs_actions import EBSActionExecutor
+from .ebs_actions import EBSActionExecutor
 
 logger = logging.getLogger()
 

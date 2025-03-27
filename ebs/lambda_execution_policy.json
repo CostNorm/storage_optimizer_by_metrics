@@ -13,7 +13,13 @@
         "ec2:CreateSnapshot",
         "ec2:CreateSnapshots",
         "ec2:CreateTags",
-        "ec2:DescribeSnapshots"
+        "ec2:DescribeSnapshots",
+        "ec2:AttachVolume",
+        "ec2:CreateVolume",
+        "ec2:DeleteVolume",
+        "ec2:DetachVolume",
+        "ec2:ModifyVolume",
+        "ec2:DescribeVolumesModifications"
       ],
       "Resource": "*"
     },
@@ -22,7 +28,11 @@
       "Action": [
         "cloudwatch:GetMetricStatistics",
         "cloudwatch:GetMetricData",
-        "cloudwatch:ListMetrics"
+        "cloudwatch:ListMetrics",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:PutMetricData"
       ],
       "Resource": "*"
     },
@@ -56,6 +66,23 @@
         "logs:PutLogEvents"
       ],
       "Resource": "arn:aws:logs:*:*:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueues"
+      ],
+      "Resource": "arn:aws:sqs:*:*:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": "arn:aws:lambda:*:*:function:*"
     }
   ]
 }

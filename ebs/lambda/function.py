@@ -1,12 +1,11 @@
-import json
-import boto3
-import logging
 from datetime import datetime
-import os
+import json
+import logging
+import boto3
 
-from ebs_analyzer import EBSAnalyzer
-from config import REGIONS, S3_BUCKET_NAME
-from actions.recommendation_executor import RecommendationExecutor
+from ebs.ebs_analyzer import EBSAnalyzer
+from ebs.config import REGIONS, S3_BUCKET_NAME
+from ebs.actions.recommendation_executor import RecommendationExecutor
 
 # 로깅 설정
 logger = logging.getLogger()

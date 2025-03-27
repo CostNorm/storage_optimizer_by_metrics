@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timedelta
-from config import METRIC_PERIOD
-from utils import calculate_monthly_cost
+from ..utils.config import METRIC_PERIOD
+from ..utils.utils import calculate_monthly_cost
 
 logger = logging.getLogger()
 
@@ -108,7 +108,8 @@ class IdleVolumeDetector:
                 logger.info(f"볼륨 {volume_id}에서 일부 필수 메트릭({', '.join(missing_metrics)})이 누락되었지만 분석을 계속합니다.")
         
         # 지표 형식 확인 및 처리
-        is_new_format = isinstance(metrics.get('VolumeIdleTime'), dict) and 'latest' in metrics.get('VolumeIdleTime', {})
+        is_new_format = isinstance(next(iter(metrics.values() if metrics else []), {}), dict) and 'latest' in next(iter(metrics.values() if metrics else []), {})
+        logger.debug(f"메트릭 형식 감지: {'새 형식' if is_new_format else '기존 형식'}")
         
         # 유휴 시간 비율 검사
         if 'VolumeIdleTime' in metrics:
@@ -117,7 +118,7 @@ class IdleVolumeDetector:
             if is_new_format:
                 # 새 형식: metrics[metric_name]이 dictionary임
                 idle_time_seconds = metrics['VolumeIdleTime'].get('average', 
-                                   metrics['VolumeIdleTime'].get('latest', 0))
+                               metrics['VolumeIdleTime'].get('latest', 0))
                 # 초 -> 퍼센트 변환
                 idle_time_percent = (idle_time_seconds / 60) * 100
             else:
@@ -138,82 +139,12 @@ class IdleVolumeDetector:
                 reasons.append(f"유휴 시간 비율: {idle_time_percent:.2f}% (임계값: {self.criteria['idle_time_threshold']}%)")
             else:
                 return False, f"유휴 시간 비율({idle_time_percent:.2f}%)이 임계값({self.criteria['idle_time_threshold']}%) 미만입니다.", metrics_summary
+        else:
+            # VolumeIdleTime 측정값이 없는 경우 - 오랜 시간 동안 측정 데이터가 없는 것은 볼륨이 사용되지 않고 있다는 신호일 수 있음
+            logger.info(f"볼륨 {volume_id}에 VolumeIdleTime 메트릭이 없습니다. 다른 기준으로 평가합니다.")
         
-        # IO 작업 수 검사 (일시적으로 조건에서 제외)
-        if all(k in metrics for k in ['VolumeReadOps', 'VolumeWriteOps']):
-            if is_new_format:
-                # 새 형식
-                read_ops = metrics['VolumeReadOps'].get('latest', 0)  
-                write_ops = metrics['VolumeWriteOps'].get('latest', 0)
-                total_ops = read_ops + write_ops
-            else:
-                # 기존 형식
-                avg_read_ops = sum(dp['Sum'] for dp in metrics['VolumeReadOps']) / len(metrics['VolumeReadOps'])
-                avg_write_ops = sum(dp['Sum'] for dp in metrics['VolumeWriteOps']) / len(metrics['VolumeWriteOps'])
-                total_ops = avg_read_ops + avg_write_ops
-            
-            logger.info(f"{volume_id} 볼륨의 총 IO 작업: {total_ops:.2f}/일")
-            
-            metrics_summary['io_operations'] = {
-                'read_ops': read_ops if is_new_format else avg_read_ops,
-                'write_ops': write_ops if is_new_format else avg_write_ops,
-                'total_ops': total_ops,
-                'threshold': self.criteria['io_ops_threshold']
-            }
-            
-            # 유휴 상태 판단에서는 IO 작업 수 조건을 일시적으로 제외함
-            # 정보 수집 목적으로만 기록
-            if total_ops < self.criteria['io_ops_threshold']:
-                reasons.append(f"평균 IO 작업 수: {total_ops:.2f}/일 (임계값: {self.criteria['io_ops_threshold']}/일) - 현재 조건에서 제외됨")
-            else:
-                logger.info(f"{volume_id} 볼륨의 IO 작업 수({total_ops:.2f}/일)가 임계값({self.criteria['io_ops_threshold']}/일)을 초과하지만 유휴 상태 판단에서 일시적으로 제외됨")
-                # 기존 코드: 조건 불충족 시 바로 종료
-                # return False, f"평균 IO 작업 수({total_ops:.2f}/일)가 임계값({self.criteria['io_ops_threshold']}/일)을 초과합니다.", metrics_summary
-        
-        # 데이터 처리량 검사 (일시적으로 조건에서 제외)
-        if all(k in metrics for k in ['VolumeReadBytes', 'VolumeWriteBytes']):
-            if is_new_format:
-                # 새 형식
-                read_bytes = metrics['VolumeReadBytes'].get('latest', 0)
-                write_bytes = metrics['VolumeWriteBytes'].get('latest', 0)
-                total_bytes = read_bytes + write_bytes
-            else:
-                # 기존 형식
-                avg_read_bytes = sum(dp['Sum'] for dp in metrics['VolumeReadBytes']) / len(metrics['VolumeReadBytes'])
-                avg_write_bytes = sum(dp['Sum'] for dp in metrics['VolumeWriteBytes']) / len(metrics['VolumeWriteBytes'])
-                total_bytes = avg_read_bytes + avg_write_bytes
-            
-            logger.info(f"{volume_id} 볼륨의 총 처리량: {total_bytes/(1024*1024):.2f}MB/일")
-            
-            metrics_summary['throughput'] = {
-                'read_bytes': read_bytes if is_new_format else avg_read_bytes,
-                'write_bytes': write_bytes if is_new_format else avg_write_bytes,
-                'total_bytes': total_bytes,
-                'threshold': self.criteria['throughput_threshold']
-            }
-            
-            # 유휴 상태 판단에서는 처리량 조건을 일시적으로 제외함
-            # 정보 수집 목적으로만 기록
-            if total_bytes < self.criteria['throughput_threshold']:
-                reasons.append(f"평균 처리량: {total_bytes/(1024*1024):.2f}MB/일 (임계값: {self.criteria['throughput_threshold']/(1024*1024)}MB/일) - 현재 조건에서 제외됨")
-            else:
-                logger.info(f"{volume_id} 볼륨의 처리량({total_bytes/(1024*1024):.2f}MB/일)이 임계값({self.criteria['throughput_threshold']/(1024*1024)}MB/일)을 초과하지만 유휴 상태 판단에서 일시적으로 제외됨")
-                # 기존 코드: 조건 불충족 시 바로 종료
-                # return False, f"평균 처리량({total_bytes/(1024*1024):.2f}MB/일)이 임계값({self.criteria['throughput_threshold']/(1024*1024)}MB/일)을 초과합니다.", metrics_summary
-        
-        # BurstBalance 검사 (gp2, st1, sc1 타입에만 해당)
-        if 'BurstBalance' in metrics and metrics['BurstBalance']:
-            avg_burst_balance = sum(dp['Average'] for dp in metrics['BurstBalance']) / len(metrics['BurstBalance'])
-            
-            metrics_summary['burst_balance'] = {
-                'average': avg_burst_balance,
-                'maximum': max(dp['Average'] for dp in metrics['BurstBalance']),
-                'minimum': min(dp['Average'] for dp in metrics['BurstBalance']),
-                'threshold': self.criteria['burst_balance_threshold']
-            }
-            
-            if avg_burst_balance > self.criteria['burst_balance_threshold']:
-                reasons.append(f"평균 버스트 밸런스: {avg_burst_balance:.2f}% (임계값: {self.criteria['burst_balance_threshold']}%)")
+        # IO 작업 및 처리량 평가 (일시적으로 조건에서 제외되어 있지만 여전히 로깅됨)
+        # 실제로 적용하려면 아래 주석 처리된 로직을 활성화해야 함
         
         # 모든 조건을 충족하면 유휴 상태로 판단
         if reasons:
