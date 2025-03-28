@@ -85,18 +85,20 @@ def send_slack_error(webhook_url, error_message):
         logger.error(f"오류 메시지 Slack 전송 중 실패: {str(e)}")
         return {"success": False, "error": str(e)}
 
-def send_analysis_result_to_slack(result, channel_id, bot_token):
+def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None, use_thread=True):
     """
     분석 결과를 Slack 채널로 전송합니다.
     
     :param result: 분석 결과
     :param channel_id: Slack 채널 ID
     :param bot_token: Slack Bot 토큰
-    :return: 전송 성공 여부
+    :param thread_ts: 스레드 타임스탬프 (스레드에 응답할 경우)
+    :param use_thread: 결과를 스레드에 표시할지 여부
+    :return: 전송 성공 여부와 thread_ts (스레드로 사용할 타임스탬프)
     """
     if not bot_token:
         logger.warning("SLACK_BOT_TOKEN이 설정되지 않았습니다. Slack 메시지를 전송할 수 없습니다.")
-        return False
+        return False, None
     
     try:
         # 메시지 구성
@@ -203,6 +205,17 @@ def send_analysis_result_to_slack(result, channel_id, bot_token):
                 "elements": actions
             })
         
+        # 메시지 JSON 구성
+        message_json = {
+            "channel": channel_id,
+            "blocks": blocks,
+            "text": f"볼륨 {volume_id} 분석 결과: {status}"
+        }
+        
+        # 스레드에 응답하는 경우
+        if use_thread and thread_ts:
+            message_json["thread_ts"] = thread_ts
+        
         # Slack API로 메시지 전송
         response = requests.post(
             "https://slack.com/api/chat.postMessage",
@@ -210,26 +223,33 @@ def send_analysis_result_to_slack(result, channel_id, bot_token):
                 "Authorization": f"Bearer {bot_token}",
                 "Content-Type": "application/json"
             },
-            json={
-                "channel": channel_id,
-                "blocks": blocks,
-                "text": f"볼륨 {volume_id} 분석 결과: {status}"
-            }
+            json=message_json
         )
         
         if response.status_code != 200 or not response.json().get('ok', False):
             logger.error(f"Slack 메시지 전송 실패: {response.status_code} {response.text}")
-            return False
+            return False, None
         
-        return True
+        # 스레드 식별자 반환 (후속 응답을 스레드로 유지하기 위함)
+        ts = response.json().get('ts')
+        return True, ts
     
     except Exception as e:
         logger.error(f"Slack 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
-        return False
+        return False, None
 
-def send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, bot_token):
+def send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, bot_token, thread_ts=None):
     """
     실행 결과를 Slack 채널로 전송합니다.
+    
+    :param result: 실행 결과
+    :param volume_id: 볼륨 ID
+    :param action_type: 액션 유형
+    :param channel_id: Slack 채널 ID 
+    :param requested_by: 요청자 ID
+    :param bot_token: Slack Bot 토큰
+    :param thread_ts: 스레드 타임스탬프 (스레드에 응답할 경우)
+    :return: 전송 성공 여부
     """
     # 기존 코드 로직을 이곳으로 이동
     if not bot_token:
@@ -281,6 +301,17 @@ def send_execution_result_to_slack(result, volume_id, action_type, channel_id, r
         
         # 세부 정보 추가 로직...
         
+        # 메시지 JSON 구성
+        message_json = {
+            "channel": channel_id,
+            "blocks": blocks,
+            "text": f"볼륨 {volume_id}에 대한 {action_name} 액션이 {('성공적으로 완료' if success else '실패')}되었습니다."
+        }
+        
+        # 스레드에 응답하는 경우
+        if thread_ts:
+            message_json["thread_ts"] = thread_ts
+        
         # Slack API로 메시지 전송
         response = requests.post(
             "https://slack.com/api/chat.postMessage",
@@ -288,11 +319,7 @@ def send_execution_result_to_slack(result, volume_id, action_type, channel_id, r
                 "Authorization": f"Bearer {bot_token}",
                 "Content-Type": "application/json"
             },
-            json={
-                "channel": channel_id,
-                "blocks": blocks,
-                "text": f"볼륨 {volume_id}에 대한 {action_name} 액션이 {('성공적으로 완료' if success else '실패')}되었습니다."
-            }
+            json=message_json
         )
         
         if response.status_code != 200 or not response.json().get('ok', False):
@@ -305,20 +332,73 @@ def send_execution_result_to_slack(result, volume_id, action_type, channel_id, r
         logger.error(f"Slack 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
         return False
 
-def send_slack_message(channel_id, message, bot_token):
+def send_slack_message(channel_id, message, bot_token, thread_ts=None):
     """
     간단한 텍스트 메시지를 Slack 채널로 전송합니다.
     
     :param channel_id: Slack 채널 ID
     :param message: 전송할 메시지
     :param bot_token: Slack Bot 토큰
-    :return: 전송 성공 여부
+    :param thread_ts: 스레드 타임스탬프 (스레드에 응답할 경우)
+    :return: 전송 성공 여부와 메시지 타임스탬프
     """
     if not bot_token:
         logger.warning("SLACK_BOT_TOKEN이 설정되지 않았습니다. Slack 메시지를 전송할 수 없습니다.")
-        return False
+        return False, None
     
     try:
+        # 메시지 JSON 구성
+        message_json = {
+            "channel": channel_id,
+            "text": message
+        }
+        
+        # 스레드에 응답하는 경우
+        if thread_ts:
+            message_json["thread_ts"] = thread_ts
+        
+        response = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json"
+            },
+            json=message_json
+        )
+        
+        if response.status_code != 200 or not response.json().get('ok', False):
+            logger.error(f"Slack 메시지 전송 실패: {response.status_code} {response.text}")
+            return False, None
+        
+        # 메시지 타임스탬프 반환 (스레드 식별용)
+        ts = response.json().get('ts')
+        return True, ts
+    
+    except Exception as e:
+        logger.error(f"Slack 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
+        return False, None
+
+def send_original_command(channel_id, command, text, bot_token, user_id):
+    """
+    사용자가 입력한 원본 명령어를 채팅에 표시하고 스레드를 생성합니다.
+    
+    :param channel_id: Slack 채널 ID
+    :param command: 사용자가 입력한 슬래시 명령어 (예: /ebs-optimize)
+    :param text: 명령어 뒤에 붙은 텍스트 (예: analyze vol-123)
+    :param bot_token: Slack Bot 토큰
+    :param user_id: 명령을 실행한 사용자 ID
+    :return: 전송 성공 여부와 스레드 타임스탬프
+    """
+    if not bot_token:
+        logger.warning("SLACK_BOT_TOKEN이 설정되지 않았습니다. Slack 메시지를 전송할 수 없습니다.")
+        return False, None
+    
+    try:
+        # 명령어를 표시하는 메시지 구성
+        formatted_command = f"{command} {text}"
+        message_text = f"<@{user_id}>님이 실행한 명령어: `{formatted_command}`"
+        
+        # Slack API로 메시지 전송
         response = requests.post(
             "https://slack.com/api/chat.postMessage",
             headers={
@@ -327,16 +407,155 @@ def send_slack_message(channel_id, message, bot_token):
             },
             json={
                 "channel": channel_id,
-                "text": message
+                "text": message_text,
+                "mrkdwn": True
             }
         )
         
         if response.status_code != 200 or not response.json().get('ok', False):
-            logger.error(f"Slack 메시지 전송 실패: {response.status_code} {response.text}")
-            return False
+            logger.error(f"원본 명령어 메시지 전송 실패: {response.status_code} {response.text}")
+            return False, None
         
-        return True
+        # 스레드 식별자 반환
+        ts = response.json().get('ts')
+        return True, ts
+    
+    except Exception as e:
+        logger.error(f"원본 명령어 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
+        return False, None
+
+def send_all_regions_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None, use_thread=True):
+    """
+    전체 리전 분석 결과를 Slack 채널로 전송합니다.
+    
+    :param result: 분석 결과
+    :param channel_id: Slack 채널 ID
+    :param bot_token: Slack Bot 토큰
+    :param thread_ts: 스레드 타임스탬프 (스레드에 응답할 경우)
+    :param use_thread: 결과를 스레드에 표시할지 여부
+    :return: 전송 성공 여부와 thread_ts (스레드로 사용할 타임스탬프)
+    """
+    if not bot_token:
+        logger.warning("SLACK_BOT_TOKEN이 설정되지 않았습니다. Slack 메시지를 전송할 수 없습니다.")
+        return False, None
+    
+    try:
+        # 요약 정보 추출
+        summary = result.get("summary", {})
+        idle_volumes = summary.get("total_idle_volumes", 0)
+        over_volumes = summary.get("total_overprovisioned_volumes", 0)
+        savings = summary.get("total_estimated_savings", 0)
+        
+        # Block Kit 메시지 생성
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "EBS 볼륨 최적화 분석 결과",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*분석 완료 시간:* {result.get('timestamp')}"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*유휴 볼륨:* {idle_volumes}개"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*과대 프로비저닝 볼륨:* {over_volumes}개"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*예상 월간 절감액:* ${savings}"
+                    }
+                ]
+            }
+        ]
+        
+        # 메시지 JSON 구성
+        message_json = {
+            "channel": channel_id,
+            "blocks": blocks,
+            "text": f"EBS 볼륨 최적화 분석 결과: 유휴 {idle_volumes}개, 과대 프로비저닝 {over_volumes}개, 예상 절감액 ${savings}/월"
+        }
+        
+        # 스레드에 응답하는 경우
+        if use_thread and thread_ts:
+            message_json["thread_ts"] = thread_ts
+        
+        # Slack API로 메시지 전송
+        response = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json"
+            },
+            json=message_json
+        )
+        
+        if response.status_code != 200 or not response.json().get('ok', False):
+            logger.error(f"Slack 메시지 전송 실패: {response.status_code} {response.text}")
+            return False, None
+        
+        # 스레드 식별자 반환 (후속 응답을 스레드로 유지하기 위함)
+        ts = response.json().get('ts')
+        
+        # 권장 조치가 있으면 스레드에 추가
+        actions = summary.get("suggested_actions", [])
+        if actions and ts:
+            # 최대 10개만 표시
+            send_actions_to_thread(actions[:10], channel_id, bot_token, ts)
+            
+            # 표시되지 않은 조치가 있는 경우 안내
+            if len(actions) > 10:
+                send_slack_message(
+                    channel_id,
+                    f"*추가 {len(actions) - 10}개의 권장 조치가 있습니다. 상세 보고서를 확인하세요.*",
+                    bot_token,
+                    ts
+                )
+        
+        return True, ts
     
     except Exception as e:
         logger.error(f"Slack 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
-        return False
+        return False, None
+
+def send_actions_to_thread(actions, channel_id, bot_token, thread_ts):
+    """
+    권장 조치 목록을 스레드에 전송합니다.
+    
+    :param actions: 권장 조치 목록
+    :param channel_id: Slack 채널 ID
+    :param bot_token: Slack Bot 토큰
+    :param thread_ts: 스레드 타임스탬프
+    """
+    try:
+        actions_text = "*권장 조치 목록:*\n\n"
+        
+        for i, action in enumerate(actions):
+            volume_id = action.get('volume_id', 'unknown')
+            region = action.get('region', 'unknown')
+            action_type = action.get('action_type', 'unknown')
+            recommendation = action.get('recommendation', '해당 없음')
+            savings = action.get('estimated_savings', 0)
+            
+            actions_text += f"*{i+1}.* 볼륨 `{volume_id}` ({region})\n"
+            actions_text += f"• 조치: {action_type}\n"
+            actions_text += f"• 추천: {recommendation}\n"
+            actions_text += f"• 예상 절감액: ${savings:.2f}/월\n\n"
+        
+        # 스레드에 메시지 전송
+        send_slack_message(channel_id, actions_text, bot_token, thread_ts)
+    except Exception as e:
+        logger.error(f"권장 조치 스레드 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)

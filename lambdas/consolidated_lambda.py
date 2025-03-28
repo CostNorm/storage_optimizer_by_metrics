@@ -44,6 +44,14 @@ SLACK_SIGNING_SECRET = os.environ.get('SLACK_SIGNING_SECRET')
 SQS_QUEUE_URL = os.environ.get('SQS_QUEUE_URL')
 SLACK_VERIFICATION_TOKEN = os.environ.get('SLACK_VERIFICATION_TOKEN')  # 이전 방식(선택적)
 SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')  # Slack Bot 토큰 추가
+LAMBDA_FUNCTION_NAME = os.environ.get('AWS_LAMBDA_FUNCTION_NAME')  # 현재 람다 함수 이름
+
+# Lambda 클라이언트 초기화 (전역 변수로 재사용)
+try:
+    LAMBDA_CLIENT = boto3.client('lambda')
+except Exception as e:
+    logger.error(f"Lambda 클라이언트 초기화 중 오류 발생: {str(e)}")
+    LAMBDA_CLIENT = None
 
 def lambda_handler(event, context):
     """
@@ -56,29 +64,48 @@ def lambda_handler(event, context):
     logger.info("EBS 스토리지 최적화 Lambda 함수 시작")
     
     try:
+        # 비동기 처리를 위한 내부 호출 여부 확인
+        is_async_processing = event.get('__async_processing', False)
+        
         # 이벤트 유형 결정
         event_type = determine_event_type(event)
         logger.info(f"이벤트 유형: {event_type}")
         
-        # 이벤트 유형에 따라 처리 로직 분기
+        # 비동기 호출이면 실제 처리 수행
+        if is_async_processing:
+            # 비동기 처리 모드에서 원래 이벤트 타입에 따른 처리
+            if event_type == "analyze_request":
+                return handle_analyze_request(event, context)
+            elif event_type == "slack_request":
+                return process_slack_request_async(event, context)
+            elif event_type == "sqs_message":
+                return handle_sqs_message(event, context)
+            else:
+                logger.error(f"지원되지 않는 이벤트 타입: {event_type}")
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({
+                        "error": f"지원되지 않는 이벤트 타입: {event_type}"
+                    })
+                }
+        
+        # 일반 호출 처리
         if event_type == "analyze_request":
-            # 분석 요청 처리 (analyze_and_notify_lambda)
+            # 분석 요청은 기존과 동일하게 처리 (이미 동기 처리가 필요)
             return handle_analyze_request(event, context)
-        
         elif event_type == "slack_request":
-            # Slack 요청 처리 (action_request_lambda)
-            return handle_slack_request(event, context)
-        
+            # Slack 요청은 즉시 응답 후 비동기 처리
+            return handle_slack_request_initial(event, context)
         elif event_type == "sqs_message":
-            # SQS 메시지 처리 (action_executor_lambda)
+            # SQS 메시지는 기존과 동일하게 처리 (이미 큐에서 가져온 요청 처리)
             return handle_sqs_message(event, context)
-        
         else:
-            # 알 수 없는 이벤트 유형
-            logger.warning(f"지원되지 않는 이벤트 유형: {event}")
+            logger.error(f"지원되지 않는 이벤트 타입: {event_type}")
             return {
                 "statusCode": 400,
-                "body": json.dumps({"error": "Unsupported event type"})
+                "body": json.dumps({
+                    "error": f"지원되지 않는 이벤트 타입: {event_type}"
+                })
             }
     
     except Exception as e:
@@ -168,17 +195,17 @@ def handle_analyze_request(event, context):
     
     return response
 
-def handle_slack_request(event, context):
+def handle_slack_request_initial(event, context):
     """
-    Slack 요청 처리 - action_request_lambda의 기능 구현
+    Slack 요청 초기 처리 - 즉시 응답 후 비동기 처리
     
     :param event: Lambda 이벤트
     :param context: Lambda 컨텍스트
     :return: Slack에 대한 응답
     """
-    logger.info("Slack 이벤트 수신")
+    logger.info("Slack 초기 요청 수신 - 즉시 응답 모드")
     
-    # API Gateway를 통해 전달된 이벤트 처리
+    # 1. 이벤트 본문 확인 (빠른 검사)
     if not event.get('body'):
         logger.error("이벤트 본문이 없습니다.")
         return {
@@ -186,37 +213,172 @@ def handle_slack_request(event, context):
             "body": json.dumps({"error": "No event body"})
         }
 
-    # Slack 요청 검증
-    if not validate_slack_request(event):
-        logger.error("Slack 요청 검증 실패")
+    # 2. 간단한 Slack 요청 유효성 검증 (최소한의 검증만 수행)
+    # 상세 검증은 실제 처리 단계에서 수행
+    headers = event.get("headers", {})
+    if not (headers.get('x-slack-signature') or headers.get('X-Slack-Signature')):
+        logger.error("Slack 서명이 없습니다.")
         return {
             "statusCode": 401,
-            "body": json.dumps({"error": "Invalid request signature"})
+            "body": json.dumps({"error": "Missing Slack signature"})
         }
     
-    # 본문 파싱
+    # 3. 본문 디코딩 (필요한 경우)
     body = event['body']
     if event.get('isBase64Encoded', False):
         body = base64.b64decode(body).decode('utf-8')
     
-    # 파라미터 처리
-    action_data = parse_slack_request(body)
-    
-    # SQS 큐에 메시지 전송 - 직접 처리하지 않고 큐에 추가
-    enqueue_result = enqueue_action(action_data)
-    
-    if not enqueue_result:
-        logger.warning("SQS 대기열에 메시지 추가 실패")
-        # 실패해도 Slack에게는 200 응답 (중복 요청 방지)
-    
-    # Slack에 즉시 응답 (3초 타임아웃 방지)
-    return {
+    # 4. Slack에 즉시 응답 (3초 타임아웃 방지)
+    response = {
         "statusCode": 200,
         "body": json.dumps({
             "response_type": "ephemeral",
             "text": "요청이 접수되었습니다. 처리 중입니다..."
         })
     }
+    
+    # 5. 자기 자신을 비동기적으로 호출하여 실제 처리 수행
+    if LAMBDA_FUNCTION_NAME and LAMBDA_CLIENT:
+        try:
+            # 원본 이벤트에 비동기 처리 플래그 추가
+            async_event = dict(event)
+            async_event['__async_processing'] = True
+            
+            # 자기 자신을 비동기적으로 호출
+            LAMBDA_CLIENT.invoke(
+                FunctionName=LAMBDA_FUNCTION_NAME,
+                InvocationType='Event',  # 비동기 호출
+                Payload=json.dumps(async_event).encode()
+            )
+            logger.info(f"비동기 처리를 위해 Lambda 함수({LAMBDA_FUNCTION_NAME})를 호출했습니다.")
+        except Exception as e:
+            logger.error(f"비동기 Lambda 호출 중 오류 발생: {str(e)}", exc_info=True)
+            # 오류가 발생해도 사용자에게는 이미 응답했으므로 계속 진행
+    else:
+        logger.warning("Lambda 함수 이름이 설정되지 않았거나 클라이언트가 초기화되지 않아 비동기 처리가 불가능합니다.")
+    
+    # 사용자에게 즉시 응답 반환
+    return response
+
+def process_slack_request_async(event, context):
+    """
+    비동기 모드에서 Slack 요청을 실제로 처리합니다.
+    
+    :param event: Lambda 이벤트 (비동기 처리 플래그 포함)
+    :param context: Lambda 컨텍스트
+    :return: 처리 결과
+    """
+    logger.info("비동기 모드에서 Slack 요청 처리 시작")
+    
+    try:
+        # 1. Slack 요청 검증 (자세한 검증)
+        is_valid = validate_slack_request(event)
+        if not is_valid:
+            logger.error("Slack 요청 검증 실패")
+            return {"statusCode": 401, "body": json.dumps({"error": "Invalid Slack request"})}
+        
+        # 2. 본문 디코딩
+        body = event['body']
+        if event.get('isBase64Encoded', False):
+            body = base64.b64decode(body).decode('utf-8')
+        
+        # 3. SQS 메시지 준비
+        action_data = {
+            "event_type": "slack_interaction",
+            "timestamp": int(time.time()),
+            "raw_event": event
+        }
+        
+        # 이벤트 유형에 따른 기본 분석
+        if "payload" in body:
+            payload = json.loads(parse_qs(body)['payload'][0])
+            action_data["interaction_type"] = "interactive_component"
+            action_data["payload"] = payload
+            
+            # 버튼 액션 등을 식별하여 ActionType 설정
+            if payload.get('type') == 'block_actions' and payload.get('actions'):
+                action_id = payload['actions'][0].get('action_id', '')
+                if action_id.startswith('execute_'):
+                    action_type = action_id.replace('execute_', '')
+                    action_data["action_type"] = action_type
+                    action_data["ActionType"] = action_type  # 일관성을 위해 두 필드 모두 설정
+                    
+                    # 버튼 값에서 파라미터 추출
+                    try:
+                        button_value = payload['actions'][0].get('value', '{}')
+                        parameters = json.loads(button_value)
+                        action_data["parameters"] = parameters
+                        
+                        # 로깅
+                        logger.info(f"버튼 액션 파라미터: {parameters}, 액션 타입: {action_type}")
+                    except Exception as e:
+                        logger.error(f"버튼 값 파싱 오류: {e}")
+                        action_data["parameters"] = {}
+                
+                # 사용자 및 채널 정보 추가
+                action_data["requested_by"] = payload.get('user', {}).get('id', 'unknown')
+                action_data["channel_id"] = payload.get('channel', {}).get('id')
+                action_data["response_url"] = payload.get('response_url')
+                action_data["thread_ts"] = payload.get('container', {}).get('thread_ts')  # 스레드 ID 추가
+        
+        elif "command" in parse_qs(body):
+            # 슬래시 커맨드
+            params = parse_qs(body)
+            command = params.get('command', [''])[0]
+            text = params.get('text', [''])[0]
+            
+            logger.info(f"슬래시 커맨드 감지: {command}, 텍스트: '{text}'")
+            
+            action_data["interaction_type"] = "slash_command"
+            action_data["command"] = command
+            action_data["text"] = text
+            action_data["action_type"] = "slash_command"  # 새로 추가
+            action_data["ActionType"] = "slash_command"  # 기존 필드 유지
+            
+            # 사용자 및 채널 정보 추가
+            requested_by = params.get('user_id', ['unknown'])[0]
+            channel_id = params.get('channel_id', [''])[0]
+            action_data["requested_by"] = requested_by
+            action_data["channel_id"] = channel_id
+            action_data["response_url"] = params.get('response_url', [''])[0]
+            
+            # 명령어 파싱 - 파라미터 추출하고 로그
+            parameters = parse_command_parameters(text)
+            action_data["parameters"] = parameters
+            logger.info(f"추출된 명령어 파라미터: {parameters}")
+            
+            # 원본 명령어를 채팅에 표시하고 스레드 생성
+            if channel_id and SLACK_BOT_TOKEN:
+                from integrations.slack.slack_messenger import send_original_command
+                success, thread_ts = send_original_command(
+                    channel_id,
+                    command,
+                    text,
+                    SLACK_BOT_TOKEN,
+                    requested_by
+                )
+                
+                if success and thread_ts:
+                    # 생성된 스레드 ID 저장 (이후 응답을 위해)
+                    action_data["thread_ts"] = thread_ts
+                    logger.info(f"원본 명령어 메시지 전송 및 스레드 생성 완료: {thread_ts}")
+        
+        # 4. SQS에 메시지 전송
+        logger.info(f"SQS에 전송할 액션 데이터: {action_data}")
+        enqueue_result = enqueue_action(action_data)
+        
+        if not enqueue_result:
+            logger.warning("SQS 대기열에 메시지 추가 실패")
+            return {"statusCode": 500, "body": json.dumps({"error": "Failed to enqueue message"})}
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"success": True, "message": "Message successfully processed and enqueued"})
+        }
+    
+    except Exception as e:
+        logger.error(f"비동기 이벤트 처리 중 오류 발생: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
 def handle_sqs_message(event, context):
     """
@@ -251,6 +413,7 @@ def handle_sqs_message(event, context):
             action_data = json.loads(record['body'])
             
             # Slack 재시도 메시지인 경우 건너뜀 (중복 처리 방지)
+            print("action_data: ", action_data)
             if is_retry_request(action_data):
                 logger.info(f"Slack 재시도 요청 감지, 메시지 건너뜀: {record['messageId']}")
                 results["details"].append({
@@ -317,37 +480,71 @@ def analyze_specific_volume(volume_id, region=None, detailed_report=False):
     # EBS 분석기 초기화
     analyzer = EBSAnalyzer(target_region)
     
-    # 특정 볼륨 분석
-    volume_result = analyzer.analyze_specific_volume(volume_id)
-    
-    # 분석 결과 포맷팅
-    formatted_result = {
-        "timestamp": datetime.now().isoformat(),
-        "volume_id": volume_id,
-        "region": target_region,
-        "is_idle": volume_result.get('is_idle', False),
-        "is_overprovisioned": volume_result.get('is_overprovisioned', False),
-        "recommendation": volume_result.get('recommendation', '해당 없음'),
-        "details": volume_result if detailed_report else {}
-    }
-    
-    # 권장 조치에 따라 작업 정의
-    if volume_result.get('is_idle', False):
-        formatted_result["suggested_action"] = "idle_volume_action"
-        formatted_result["action_params"] = {
+    try:
+        # 특정 볼륨 분석
+        volume_result = analyzer.analyze_specific_volume(volume_id)
+        
+        # 오류 확인
+        if 'error' in volume_result:
+            logger.error(f"볼륨 {volume_id} 분석 중 오류: {volume_result['error']}")
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "volume_id": volume_id,
+                "region": target_region,
+                "error": volume_result['error'],
+                "status": "오류 발생",
+                "recommendation": "볼륨 정보를 가져올 수 없습니다. 볼륨 ID가 올바른지, 해당 리전에 존재하는지 확인하세요."
+            }
+        
+        # 분석 결과 포맷팅
+        formatted_result = {
+            "timestamp": datetime.now().isoformat(),
             "volume_id": volume_id,
             "region": target_region,
-            "action_type": "snapshot_and_delete" if "스냅샷 생성 후 볼륨 삭제" in volume_result.get('recommendation', '') else "change_type"
+            "is_idle": volume_result.get('is_idle', False),
+            "is_overprovisioned": volume_result.get('is_overprovisioned', False),
+            "recommendation": volume_result.get('recommendation', '해당 없음'),
+            "status": volume_result.get('status', '알 수 없음'),
+            "details": volume_result if detailed_report else {}
         }
-    elif volume_result.get('is_overprovisioned', False):
-        formatted_result["suggested_action"] = "overprovisioned_volume_action"
-        formatted_result["action_params"] = {
+        
+        # 디버깅을 위한 분석 상세 정보
+        if 'idle_check_details' in volume_result:
+            formatted_result['idle_diagnosis'] = volume_result['idle_check_details']
+        
+        if 'overprovisioned_check_details' in volume_result:
+            formatted_result['overprovisioned_diagnosis'] = volume_result['overprovisioned_check_details']
+        
+        # 권장 조치에 따라 작업 정의
+        if volume_result.get('is_idle', False):
+            formatted_result["suggested_action"] = "idle_volume_action"
+            formatted_result["action_params"] = {
+                "volume_id": volume_id,
+                "region": target_region,
+                "action_type": "snapshot_and_delete" if "스냅샷 생성 후 볼륨 삭제" in volume_result.get('recommendation', '') else "change_type"
+            }
+        elif volume_result.get('is_overprovisioned', False):
+            formatted_result["suggested_action"] = "overprovisioned_volume_action"
+            formatted_result["action_params"] = {
+                "volume_id": volume_id,
+                "region": target_region,
+                "action_type": "resize"
+            }
+        else:
+            formatted_result["suggested_action"] = "none"
+            formatted_result["action_params"] = {}
+        
+        return formatted_result
+    except Exception as e:
+        logger.error(f"볼륨 {volume_id} 분석 중 예외 발생: {str(e)}", exc_info=True)
+        return {
+            "timestamp": datetime.now().isoformat(),
             "volume_id": volume_id,
             "region": target_region,
-            "action_type": "resize"
+            "error": str(e),
+            "status": "예외 발생",
+            "recommendation": "볼륨 분석 중 예기치 않은 오류가 발생했습니다."
         }
-    
-    return formatted_result
 
 def analyze_all_regions(event, detailed_report=False):
     """
@@ -474,16 +671,17 @@ def save_result_to_s3(result):
         logger.error(f"결과를 S3에 저장하는 중 오류 발생: {str(e)}")
         return "S3 저장 실패"
 
-def send_to_slack(result):
+def send_to_slack(result, channel_id=None):
     """
     분석 결과를 Slack으로 전송합니다.
     
     :param result: 분석 결과
+    :param channel_id: Slack 채널 ID (있는 경우)
     :return: Slack API 응답
     """
-    if not SLACK_WEBHOOK_URL:
-        logger.warning("Slack 웹훅 URL이 설정되지 않았습니다. Slack 알림을 건너뜁니다.")
-        return {"skipped": True, "reason": "No webhook URL configured"}
+    if not SLACK_WEBHOOK_URL and not (channel_id and SLACK_BOT_TOKEN):
+        logger.warning("Slack 웹훅 URL이나 봇 토큰이 설정되지 않았습니다. Slack 알림을 건너뜁니다.")
+        return {"skipped": True, "reason": "No webhook URL or bot token configured"}
     
     try:
         # 요약 정보 추출
@@ -561,7 +759,7 @@ def send_to_slack(result):
                             "emoji": True
                         },
                         "value": json.dumps(action['action_params']),
-                        "action_id": f"execute_{action['action_type']}"
+                        "action_id": f"execute_{action['action_params']['action_type']}"
                     }
                 })
             
@@ -578,20 +776,42 @@ def send_to_slack(result):
                 })
         
         # 메시지 전송
-        payload = {
-            "blocks": blocks,
-            "text": f"EBS 볼륨 최적화 분석 결과: 유휴 {idle_volumes}개, 과대 프로비저닝 {over_volumes}개, 예상 절감액 ${savings}/월"
-        }
+        text = f"EBS 볼륨 최적화 분석 결과: 유휴 {idle_volumes}개, 과대 프로비저닝 {over_volumes}개, 예상 절감액 ${savings}/월"
         
-        response = requests.post(
-            SLACK_WEBHOOK_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Slack으로 메시지 전송 실패: {response.status_code} {response.text}")
-            return {"success": False, "status_code": response.status_code, "response": response.text}
+        if channel_id and SLACK_BOT_TOKEN:
+            # Bot 토큰을 사용하여 특정 채널에 메시지 전송
+            response = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={
+                    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "channel": channel_id,
+                    "blocks": blocks,
+                    "text": text
+                }
+            )
+            
+            if response.status_code != 200 or not response.json().get('ok', False):
+                logger.error(f"Slack API로 메시지 전송 실패: {response.status_code} {response.text}")
+                return {"success": False, "status_code": response.status_code, "response": response.text}
+        else:
+            # Webhook URL을 사용하여 메시지 전송
+            payload = {
+                "blocks": blocks,
+                "text": text
+            }
+            
+            response = requests.post(
+                SLACK_WEBHOOK_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Slack으로 메시지 전송 실패: {response.status_code} {response.text}")
+                return {"success": False, "status_code": response.status_code, "response": response.text}
         
         return {"success": True}
     
@@ -692,6 +912,19 @@ def parse_slack_request(body):
                 action_data["requested_by"] = payload.get('user', {}).get('id', 'unknown')
                 action_data["channel_id"] = payload.get('channel', {}).get('id')
                 action_data["response_url"] = payload.get('response_url')
+                
+                # 스레드 정보 추출 - 메시지가 스레드의 일부인 경우
+                # 메인 메시지의 ts는 container > message_ts에 있고
+                # 스레드 메시지는 container > thread_ts에도 있음
+                container = payload.get('container', {})
+                message_ts = container.get('message_ts')
+                thread_ts = payload.get('message', {}).get('thread_ts') or container.get('thread_ts')
+                
+                # 메시지가 이미 스레드인 경우 thread_ts를 사용하고, 
+                # 그렇지 않은 경우 message_ts를 스레드 시작점으로 사용
+                action_data["thread_ts"] = thread_ts or message_ts
+                
+                logger.info(f"스레드 정보 추출: thread_ts={action_data.get('thread_ts')}")
     
     elif "command" in parse_qs(body):
         # 슬래시 커맨드
@@ -724,39 +957,54 @@ def parse_command_parameters(text):
     params = {}
     words = text.split()
     
+    # 디버그 로그 추가
+    logger.info(f"슬래시 커맨드 파싱 시작. 텍스트: '{text}', 단어 갯수: {len(words)}")
+    
     if not words:
+        logger.warning("파싱할 커맨드 텍스트가 없습니다.")
         return params
     
     # 첫 번째 단어는 하위 명령어로 취급
     command = words[0].lower()
+    logger.info(f"감지된 명령어: {command}")
     
     if command == "analyze":
         params["action_type"] = "analyze"
         
         # 두 번째 단어가 있으면 볼륨 ID로 취급
-        if len(words) > 1:
+        if len(words) > 1 and words[1].startswith("vol-"):
             params["volume_id"] = words[1]
+            logger.info(f"볼륨 ID 감지: {params['volume_id']}")
         
         # 리전 파라미터 확인 (--region=xxx 형식)
         for word in words[2:]:
             if word.startswith("--region="):
                 params["region"] = word.split("=")[1]
+                logger.info(f"리전 감지: {params['region']}")
             elif word == "--detailed":
                 params["detailed_report"] = True
+                logger.info("상세 보고서 옵션 활성화됨")
     
     elif command == "execute":
         params["action_type"] = "execute"
         
         # 볼륨 ID와 액션 타입 필요
         if len(words) >= 3:
-            params["volume_id"] = words[1]
-            params["action_type"] = words[2]
+            # 두 번째 단어가 볼륨 ID인지 확인
+            if words[1].startswith("vol-"):
+                params["volume_id"] = words[1]
+                logger.info(f"볼륨 ID 감지: {params['volume_id']}")
+                # 세 번째 단어는 액션 타입
+                params["action_type"] = words[2]
+                logger.info(f"액션 타입 감지: {params['action_type']}")
         
         # 리전 파라미터 확인
         for word in words[3:]:
             if word.startswith("--region="):
                 params["region"] = word.split("=")[1]
+                logger.info(f"리전 감지: {params['region']}")
     
+    logger.info(f"파싱된 파라미터: {params}")
     return params
 
 # action_executor_lambda.py에서 가져온 함수들
@@ -782,11 +1030,19 @@ def process_action(action_data):
     """
     action_type = action_data.get('action_type')
     parameters = action_data.get('parameters', {})
+    text = action_data.get('text', '')
     requested_by = action_data.get('requested_by', 'unknown')
     channel_id = action_data.get('channel_id')
     response_url = action_data.get('response_url')
+    thread_ts = action_data.get('thread_ts')  # 스레드 타임스탬프 추출
     
-    logger.info(f"액션 처리 중: {action_type}, 파라미터: {parameters}")
+    logger.info(f"액션 처리 중: {action_type}, 파라미터: {parameters}, 스레드 TS: {thread_ts}")
+    
+    # 파라미터가 비어 있고, slash_command 타입이면 텍스트에서 다시 파싱 시도
+    if action_type == 'slash_command' and not parameters and text:
+        logger.info(f"파라미터가 비어 있어 텍스트에서 다시 파싱 시도: '{text}'")
+        parameters = parse_command_parameters(text)
+        logger.info(f"재파싱된 파라미터: {parameters}")
     
     # 직접적인 액션 타입 처리 (snapshot_and_delete, snapshot_only, resize, change_type)
     direct_actions = ['snapshot_and_delete', 'snapshot_only', 'resize', 'change_type']
@@ -799,17 +1055,17 @@ def process_action(action_data):
                 'action_type': action_type
             }
         # 직접 실행 함수 호출
-        return process_execute_action(parameters, requested_by, channel_id, response_url)
+        return process_execute_action(parameters, requested_by, channel_id, response_url, thread_ts)
     
     # 기존 액션 유형에 따른 처리
     if action_type == 'analyze':
-        return process_analyze_action(parameters, requested_by, channel_id)
+        return process_analyze_action(parameters, requested_by, channel_id, thread_ts)
     elif action_type == 'execute':
-        return process_execute_action(parameters, requested_by, channel_id, response_url)
+        return process_execute_action(parameters, requested_by, channel_id, response_url, thread_ts)
     elif action_type == 'slash_command':
         return process_slash_command(action_data)
     elif action_type and (action_type.startswith('idle_volume_') or action_type.startswith('overprovisioned_volume_')):
-        return process_volume_action(action_type, parameters, requested_by, channel_id, response_url)
+        return process_volume_action(action_type, parameters, requested_by, channel_id, response_url, thread_ts)
     else:
         logger.error(f"지원되지 않는 액션 유형: {action_type}")
         return {
@@ -817,13 +1073,14 @@ def process_action(action_data):
             "error": f"지원되지 않는 액션 유형: {action_type}"
         }
 
-def process_analyze_action(parameters, requested_by, channel_id):
+def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None):
     """
     볼륨 분석 액션을 처리합니다.
     
     :param parameters: 분석 파라미터
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
+    :param thread_ts: 스레드 타임스탬프
     :return: 처리 결과
     """
     try:
@@ -833,21 +1090,128 @@ def process_analyze_action(parameters, requested_by, channel_id):
         region = parameters.get('region')
         detailed_report = parameters.get('detailed_report', True)
         
-        # 분석 시작 알림
-        if channel_id:
+        # 분석 시작 알림을 스레드에 표시
+        if channel_id and thread_ts:
             if volume_id:
-                send_slack_message(channel_id, f"볼륨 `{volume_id}` 분석이 시작되었습니다. 요청자: <@{requested_by}>", SLACK_BOT_TOKEN)
+                send_slack_message(
+                    channel_id, 
+                    f"볼륨 `{volume_id}` 분석이 진행 중입니다...", 
+                    SLACK_BOT_TOKEN, 
+                    thread_ts
+                )
             else:
-                send_slack_message(channel_id, f"전체 EBS 볼륨 분석이 시작되었습니다. 요청자: <@{requested_by}>", SLACK_BOT_TOKEN)
+                send_slack_message(
+                    channel_id, 
+                    f"전체 EBS 볼륨 분석이 진행 중입니다...", 
+                    SLACK_BOT_TOKEN, 
+                    thread_ts
+                )
         
-        # 여기서 이제 외부 Lambda를 호출하는 대신 직접 분석 실행
-        # 같은 Lambda 내의 분석 함수 직접 호출
+        # 여기서 실제 분석 실행
         if volume_id:
             result = analyze_specific_volume(volume_id, region, detailed_report)
             
+            # 분석 중 오류가 발생한 경우
+            if 'error' in result:
+                error_message = f"볼륨 {volume_id} 분석 중 오류가 발생했습니다: {result['error']}"
+                logger.error(error_message)
+                
+                # 오류 메시지를 스레드에 표시
+                if channel_id and thread_ts:
+                    send_slack_message(
+                        channel_id,
+                        error_message,
+                        SLACK_BOT_TOKEN,
+                        thread_ts
+                    )
+                
+                return {
+                    "success": False,
+                    "error": result['error'],
+                    "message": error_message
+                }
+            
             # Slack 채널에 메시지 전송
             if channel_id:
-                send_analysis_result_to_slack(result, channel_id, SLACK_BOT_TOKEN)
+                # 분석 결과를 메인 채팅에 표시 (use_thread=False로 설정)
+                from integrations.slack.slack_messenger import send_analysis_result_to_slack
+                success, msg_ts = send_analysis_result_to_slack(
+                    result, 
+                    channel_id, 
+                    SLACK_BOT_TOKEN, 
+                    thread_ts=None,  # 메인 채팅에 표시
+                    use_thread=False
+                )
+                
+                # 세부 분석 정보는 스레드에 표시
+                if thread_ts:
+                    # 세부 정보 텍스트 구성
+                    details_text = f"*볼륨 {volume_id}의 세부 분석 정보:*\n\n"
+                    
+                    # 볼륨 기본 정보 추가
+                    volume_details = result.get('details', {})
+                    
+                    # 볼륨 상태 정보 추가
+                    details_text += f"*볼륨 상태:* {volume_details.get('state', '알 수 없음')}\n"
+                    details_text += f"*볼륨 유형:* {volume_details.get('volume_type', '알 수 없음')}\n"
+                    details_text += f"*크기:* {volume_details.get('size', 0)} GB\n"
+                    details_text += f"*월 비용:* ${volume_details.get('monthly_cost', 0):.2f}\n\n"
+                    
+                    # 메트릭 정보가 있으면 추가
+                    if 'metrics' in volume_details:
+                        metrics = volume_details.get('metrics', {})
+                        details_text += "*주요 메트릭:*\n"
+                        
+                        # 유휴 시간 정보 표시
+                        if 'VolumeIdleTime_percent' in metrics:
+                            idle_percent = metrics['VolumeIdleTime_percent']
+                            details_text += f"• 볼륨 유휴 시간: {idle_percent:.2f}%\n"
+                        elif 'VolumeIdleTime' in metrics:
+                            idle_time = metrics['VolumeIdleTime']
+                            details_text += f"• 볼륨 유휴 시간: {idle_time:.2f}분/시간 ({idle_time/60*100:.2f}%)\n"
+                        
+                        # 읽기/쓰기 작업 정보 표시
+                        if 'VolumeReadOps' in metrics:
+                            details_text += f"• 읽기 작업: {metrics['VolumeReadOps']:.2f} ops/s\n"
+                        if 'VolumeWriteOps' in metrics:
+                            details_text += f"• 쓰기 작업: {metrics['VolumeWriteOps']:.2f} ops/s\n"
+                        
+                        # 추가 메트릭 정보 표시
+                        if 'VolumeQueueLength' in metrics:
+                            details_text += f"• 대기열 길이: {metrics['VolumeQueueLength']:.2f}\n"
+                        if 'VolumeThroughputPercentage' in metrics:
+                            details_text += f"• 처리량: {metrics['VolumeThroughputPercentage']:.2f}%\n"
+                        if 'BurstBalance' in metrics:
+                            details_text += f"• 버스트 밸런스: {metrics['BurstBalance']:.2f}%\n"
+                    else:
+                        details_text += "*메트릭 정보가 없습니다.*\n\n"
+                    
+                    # 유휴 상태 분석 결과 표시
+                    if 'idle_check_details' in volume_details:
+                        idle_details = volume_details['idle_check_details']
+                        details_text += "\n*유휴 상태 분석:*\n"
+                        details_text += f"• 유휴 상태: {'예' if idle_details.get('result', False) else '아니오'}\n"
+                        details_text += f"• 이유: {idle_details.get('reason', '해당 없음')}\n"
+                    
+                    # 과대 프로비저닝 분석 결과 표시
+                    if 'overprovisioned_check_details' in volume_details:
+                        over_details = volume_details['overprovisioned_check_details']
+                        details_text += "\n*과대 프로비저닝 분석:*\n"
+                        details_text += f"• 과대 프로비저닝: {'예' if over_details.get('result', False) else '아니오'}\n"
+                        details_text += f"• 이유: {over_details.get('reason', '해당 없음')}\n"
+                    
+                    # 권장 사항 표시
+                    recommendation = result.get('recommendation')
+                    if recommendation:
+                        details_text += f"\n*권장 조치:* {recommendation}\n"
+                    
+                    # 오류가 있으면 표시
+                    if 'error' in result:
+                        details_text += f"\n*오류:* {result['error']}\n"
+                        details_text += "\n볼륨 상태가 정상적으로 표시되지 않습니다."
+                    
+                    # 스레드에 세부 정보 메시지 전송
+                    send_slack_message(channel_id, details_text, SLACK_BOT_TOKEN, thread_ts)
         else:
             # 전체 볼륨 분석
             result = analyze_all_regions({"detailed_report": detailed_report}, detailed_report)
@@ -855,29 +1219,52 @@ def process_analyze_action(parameters, requested_by, channel_id):
             # 결과를 S3에 저장
             s3_location = save_result_to_s3(result)
             
-            # Slack으로 결과 전송
+            # 메인 채팅에 분석 결과 표시
             if channel_id:
-                send_to_slack(result)
+                # 요약 결과를 메인 채팅에 표시
+                from integrations.slack.slack_messenger import send_all_regions_analysis_result_to_slack
+                success, msg_ts = send_all_regions_analysis_result_to_slack(
+                    result, 
+                    channel_id, 
+                    SLACK_BOT_TOKEN,
+                    thread_ts=None,  # 메인 채팅에 표시
+                    use_thread=False
+                )
+                
+                # S3 저장 정보는 스레드에 표시
+                if thread_ts:
+                    send_slack_message(
+                        channel_id,
+                        f"전체 분석 결과가 S3에 저장되었습니다: {s3_location}",
+                        SLACK_BOT_TOKEN,
+                        thread_ts
+                    )
         
         return {
             "success": True,
             "message": f"볼륨 분석이 완료되었습니다.",
-            "result": "완료"
+            "result": "완료",
+            "thread_ts": thread_ts
         }
     
     except Exception as e:
         logger.error(f"볼륨 분석 중 오류 발생: {str(e)}", exc_info=True)
         
         # 오류 발생 시 Slack 알림
-        if channel_id:
-            send_slack_message(channel_id, f"볼륨 분석 중 오류가 발생했습니다: {str(e)}", SLACK_BOT_TOKEN)
+        if channel_id and thread_ts:
+            send_slack_message(
+                channel_id, 
+                f"볼륨 분석 중 오류가 발생했습니다: {str(e)}", 
+                SLACK_BOT_TOKEN,
+                thread_ts
+            )
         
         return {
             "success": False,
             "error": str(e)
         }
 
-def process_execute_action(parameters, requested_by, channel_id, response_url=None):
+def process_execute_action(parameters, requested_by, channel_id, response_url=None, thread_ts=None):
     """
     볼륨에 대한 조치 실행 액션을 처리합니다.
     
@@ -885,6 +1272,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
     :param response_url: Slack 응답 URL
+    :param thread_ts: 스레드 타임스탬프
     :return: 처리 결과
     """
     try:
@@ -900,12 +1288,13 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         
         logger.info(f"볼륨 {volume_id}에 {action_type} 액션 실행 시작")
         
-        # 실행 전 Slack 알림
-        if channel_id:
+        # 실행 진행 알림은 스레드에 표시
+        if channel_id and thread_ts:
             send_slack_message(
                 channel_id,
-                f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 시작되었습니다. 요청자: <@{requested_by}>",
-                SLACK_BOT_TOKEN
+                f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 진행 중입니다...",
+                SLACK_BOT_TOKEN,
+                thread_ts
             )
         
         # 먼저 볼륨 상태 확인
@@ -915,9 +1304,9 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         if not volume_info or 'error' in volume_info:
             error_msg = volume_info.get('error', '볼륨 정보를 가져올 수 없습니다.')
             
-            # 오류 알림
-            if channel_id:
-                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN)
+            # 오류 알림은 스레드에 표시
+            if channel_id and thread_ts:
+                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN, thread_ts)
             
             return {
                 "success": False,
@@ -933,10 +1322,19 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         else:
             result = executor.execute_overprovisioned_volume_recommendation(volume_info, action_type)
         
-        # 결과 알림
+        # 결과 알림 - 실행 결과는 메인 채팅에 표시하고 세부 정보는 스레드에 표시
         if channel_id:
-            # 실행 결과를 포맷팅하여 Slack으로 전송
-            send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN)
+            # 기본 실행 결과는 메인 채팅에 표시
+            action_name = action_type.replace('_', ' ').title()
+            success = result.get('success', False)
+            
+            # 메인 채팅에 결과 메시지 표시
+            message = f"볼륨 `{volume_id}`에 대한 `{action_name}` 액션이 {('성공적으로 완료' if success else '실패')}되었습니다."
+            send_slack_message(channel_id, message, SLACK_BOT_TOKEN)
+            
+            # 세부 결과는 스레드에 표시
+            if thread_ts:
+                send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN, thread_ts)
         
         return {
             "success": True,
@@ -948,12 +1346,13 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         logger.error(f"볼륨 액션 실행 중 오류 발생: {str(e)}", exc_info=True)
         
         # 오류 발생 시 Slack 알림
-        if channel_id:
+        if channel_id and thread_ts:
             send_slack_message(
                 channel_id,
                 f"볼륨 `{parameters.get('volume_id', 'unknown')}`에 대한 `{parameters.get('action_type', 'unknown')}` "
                 f"액션 실행 중 오류가 발생했습니다: {str(e)}",
-                SLACK_BOT_TOKEN
+                SLACK_BOT_TOKEN,
+                thread_ts
             )
         
         return {
@@ -972,10 +1371,20 @@ def process_slash_command(action_data):
     parameters = action_data.get('parameters', {})
     requested_by = action_data.get('requested_by', 'unknown')
     channel_id = action_data.get('channel_id')
+    thread_ts = action_data.get('thread_ts')  # 스레드 ID 추출
+    
+    # 커맨드 처리 전 로그 출력
+    logger.info(f"슬래시 커맨드 처리 시작. 텍스트: '{text}', 파라미터: {parameters}, 스레드 TS: {thread_ts}")
+    
+    # 파라미터가 비어 있으면 텍스트에서 다시 파싱 시도
+    if not parameters and text:
+        logger.info(f"파라미터가 비어 있어 텍스트에서 다시 파싱 시도: '{text}'")
+        parameters = parse_command_parameters(text)
+        logger.info(f"재파싱된 파라미터: {parameters}")
     
     words = text.split()
     if not words:
-        # 도움말 표시
+        # 도움말 표시는 메인 채팅에 표시
         if channel_id:
             send_slack_message(channel_id, 
                 "EBS 볼륨 최적화 도구 사용법:\n"
@@ -988,17 +1397,21 @@ def process_slash_command(action_data):
         return {"success": True, "message": "도움말 표시됨"}
     
     command = words[0].lower()
+    logger.info(f"슬래시 커맨드 감지된 명령어: {command}")
     
     if command == "analyze":
-        return process_analyze_action(parameters, requested_by, channel_id)
+        logger.info(f"analyze 명령 처리 시작, 파라미터: {parameters}, 스레드 TS: {thread_ts}")
+        return process_analyze_action(parameters, requested_by, channel_id, thread_ts)
     elif command == "execute":
-        return process_execute_action(parameters, requested_by, channel_id)
+        logger.info(f"execute 명령 처리 시작, 파라미터: {parameters}, 스레드 TS: {thread_ts}")
+        return process_execute_action(parameters, requested_by, channel_id, None, thread_ts)
     else:
+        # 알 수 없는 명령어 응답은 메인 채팅에 표시
         if channel_id:
             send_slack_message(channel_id, f"알 수 없는 명령어: {command}. 사용 가능한 명령어: analyze, execute", SLACK_BOT_TOKEN)
         return {"success": False, "error": f"알 수 없는 명령어: {command}"}
 
-def process_volume_action(action_type, parameters, requested_by, channel_id, response_url=None):
+def process_volume_action(action_type, parameters, requested_by, channel_id, response_url=None, thread_ts=None):
     """
     볼륨에 대한 직접 조치를 처리합니다.
     
@@ -1007,6 +1420,7 @@ def process_volume_action(action_type, parameters, requested_by, channel_id, res
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
     :param response_url: Slack 응답 URL
+    :param thread_ts: 스레드 타임스탬프
     :return: 처리 결과
     """
     # 이 함수는 process_execute_action과 유사하게 동작하지만,
@@ -1021,7 +1435,7 @@ def process_volume_action(action_type, parameters, requested_by, channel_id, res
         'volume_id': volume_id,
         'region': region,
         'action_type': action_subtype
-    }, requested_by, channel_id, response_url)
+    }, requested_by, channel_id, response_url, thread_ts)
 
 # Lambda 함수 진입점
 if __name__ == "__main__":

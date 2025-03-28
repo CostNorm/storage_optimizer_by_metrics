@@ -137,17 +137,18 @@ def process_action(action_data):
     requested_by = action_data.get('requested_by', 'unknown')
     channel_id = action_data.get('channel_id')
     response_url = action_data.get('response_url')
+    thread_ts = action_data.get('thread_ts')  # 스레드 타임스탬프 추가
     
     logger.info(f"액션 처리 중: {action_type}, 파라미터: {parameters}")
     
     # 액션 유형에 따른 처리
     if action_type == 'analyze':
-        return process_analyze_action(parameters, requested_by, channel_id)
+        return process_analyze_action(parameters, requested_by, channel_id, thread_ts)
     elif action_type == 'execute':
-        return process_execute_action(parameters, requested_by, channel_id, response_url)
+        return process_execute_action(parameters, requested_by, channel_id, response_url, thread_ts)
     elif action_type.startswith('idle_volume_') or action_type.startswith('overprovisioned_volume_'):
         # 직접적인 볼륨 액션 처리
-        return process_volume_action(action_type, parameters, requested_by, channel_id, response_url)
+        return process_volume_action(action_type, parameters, requested_by, channel_id, response_url, thread_ts)
     else:
         logger.error(f"지원되지 않는 액션 유형: {action_type}")
         return {
@@ -155,13 +156,14 @@ def process_action(action_data):
             "error": f"지원되지 않는 액션 유형: {action_type}"
         }
 
-def process_analyze_action(parameters, requested_by, channel_id):
+def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None):
     """
     볼륨 분석 액션을 처리합니다.
     
     :param parameters: 분석 파라미터
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
+    :param thread_ts: 스레드 타임스탬프 (이미 존재하는 스레드에 응답하는 경우)
     :return: 처리 결과
     """
     try:
@@ -190,19 +192,31 @@ def process_analyze_action(parameters, requested_by, channel_id):
                 "details": result if detailed_report else {}
             }
             
-            # Slack 채널에 메시지 전송
+            # Slack 채널에 메시지 전송하고 thread_ts 받기
             if channel_id:
-                send_analysis_result_to_slack(formatted_result, channel_id, SLACK_BOT_TOKEN)
+                success, new_thread_ts = send_analysis_result_to_slack(formatted_result, channel_id, SLACK_BOT_TOKEN)
+                # 분석 결과의 ts를 향후 액션에 사용할 수 있도록 반환값에 포함
+                formatted_result["thread_ts"] = new_thread_ts
             
             return {
                 "success": True,
                 "message": f"볼륨 {volume_id} 분석이 완료되었습니다.",
-                "result": formatted_result
+                "result": formatted_result,
+                "thread_ts": formatted_result.get("thread_ts")  # thread_ts를 반환값에 포함
             }
         else:
             # 전체 볼륨 분석은 많은 시간이 소요될 수 있으므로 분석 시작 알림
             if channel_id:
-                send_slack_message(channel_id, f"전체 EBS 볼륨 분석이 시작되었습니다. 요청자: <@{requested_by}>")
+                # 기존 스레드가 없으면 새 메시지 시작, 있으면 스레드에 응답
+                success, new_thread_ts = send_slack_message(
+                    channel_id, 
+                    f"전체 EBS 볼륨 분석이 시작되었습니다. 요청자: <@{requested_by}>", 
+                    SLACK_BOT_TOKEN,
+                    thread_ts
+                )
+                # 새로운 스레드 시작이면 thread_ts 저장
+                if not thread_ts and new_thread_ts:
+                    thread_ts = new_thread_ts
             
             # 직접 분석 실행 (Lambda 호출하는 대신 내부 함수 호출)
             from analyze_and_notify_lambda import analyze_all_regions
@@ -211,7 +225,8 @@ def process_analyze_action(parameters, requested_by, channel_id):
             analysis_params = {
                 'output_format': 'slack',
                 'detailed_report': detailed_report,
-                'channel_id': channel_id
+                'channel_id': channel_id,
+                'thread_ts': thread_ts  # 스레드 정보 전달
             }
             
             # 분석 실행 (이 함수를 비동기로 실행하거나, 백그라운드 태스크로 실행하는 것이 좋음)
@@ -224,7 +239,8 @@ def process_analyze_action(parameters, requested_by, channel_id):
             return {
                 "success": True,
                 "message": "전체 볼륨 분석 요청이 처리되었습니다.",
-                "result": "처리 중"
+                "result": "처리 중",
+                "thread_ts": thread_ts  # thread_ts를 반환값에 포함
             }
     
     except Exception as e:
@@ -232,14 +248,19 @@ def process_analyze_action(parameters, requested_by, channel_id):
         
         # 오류 발생 시 Slack 알림
         if channel_id:
-            send_slack_message(channel_id, f"볼륨 분석 중 오류가 발생했습니다: {str(e)}", SLACK_BOT_TOKEN)
+            send_slack_message(
+                channel_id, 
+                f"볼륨 분석 중 오류가 발생했습니다: {str(e)}", 
+                SLACK_BOT_TOKEN,
+                thread_ts  # 스레드가 있는 경우 같은 스레드에 오류 메시지 전송
+            )
         
         return {
             "success": False,
             "error": str(e)
         }
 
-def process_execute_action(parameters, requested_by, channel_id, response_url=None):
+def process_execute_action(parameters, requested_by, channel_id, response_url=None, thread_ts=None):
     """
     볼륨에 대한 조치 실행 액션을 처리합니다.
     
@@ -247,6 +268,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
     :param response_url: Slack 응답 URL
+    :param thread_ts: 스레드 타임스탬프
     :return: 처리 결과
     """
     try:
@@ -264,10 +286,12 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         
         # 실행 전 Slack 알림
         if channel_id:
+            # 스레드에 알림 메시지 전송
             send_slack_message(
                 channel_id,
                 f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 시작되었습니다. 요청자: <@{requested_by}>",
-                SLACK_BOT_TOKEN
+                SLACK_BOT_TOKEN,
+                thread_ts  # 스레드가 있는 경우 스레드에 메시지 전송
             )
         
         # 먼저 볼륨 상태 확인
@@ -279,7 +303,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
             
             # 오류 알림
             if channel_id:
-                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN)
+                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN, thread_ts)
             
             return {
                 "success": False,
@@ -297,13 +321,14 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         
         # 결과 알림
         if channel_id:
-            # 실행 결과를 포맷팅하여 Slack으로 전송
-            send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN)
+            # 실행 결과를 포맷팅하여 Slack으로 전송 (같은 스레드에)
+            send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN, thread_ts)
         
         return {
             "success": True,
             "message": f"볼륨 {volume_id}에 대한 {action_type} 액션이 완료되었습니다.",
-            "result": result
+            "result": result,
+            "thread_ts": thread_ts  # thread_ts를 반환값에 포함
         }
     
     except Exception as e:
@@ -315,7 +340,8 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
                 channel_id,
                 f"볼륨 `{parameters.get('volume_id', 'unknown')}`에 대한 `{parameters.get('action_type', 'unknown')}` "
                 f"액션 실행 중 오류가 발생했습니다: {str(e)}",
-                SLACK_BOT_TOKEN
+                SLACK_BOT_TOKEN,
+                thread_ts  # 스레드가 있는 경우 같은 스레드에 오류 메시지 전송
             )
         
         return {
@@ -323,7 +349,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
             "error": str(e)
         }
 
-def process_volume_action(action_type, parameters, requested_by, channel_id, response_url=None):
+def process_volume_action(action_type, parameters, requested_by, channel_id, response_url=None, thread_ts=None):
     """
     볼륨에 대한 직접 조치를 처리합니다.
     
@@ -332,6 +358,7 @@ def process_volume_action(action_type, parameters, requested_by, channel_id, res
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
     :param response_url: Slack 응답 URL
+    :param thread_ts: 스레드 타임스탬프
     :return: 처리 결과
     """
     # 이 함수는 process_execute_action과 유사하게 동작하지만,
@@ -346,4 +373,4 @@ def process_volume_action(action_type, parameters, requested_by, channel_id, res
         'volume_id': volume_id,
         'region': region,
         'action_type': action_subtype
-    }, requested_by, channel_id, response_url)
+    }, requested_by, channel_id, response_url, thread_ts)
