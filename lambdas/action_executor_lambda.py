@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from actions.recommendation_executor import RecommendationExecutor
 from utils.ebs_analyzer import EBSAnalyzer
-from integrations.slack.slack_messenger import send_slack_message, send_analysis_result_to_slack, send_execution_result_to_slack
+from integrations.slack.slack_messenger import send_slack_message, send_analysis_result_to_slack, send_execution_result_to_slack, update_analysis_result_message
 
 # 환경 변수 로드
 load_dotenv()
@@ -120,10 +120,29 @@ def is_retry_request(action_data):
     :return: 재시도 여부
     """
     if 'raw_event' not in action_data:
+        logger.warning("raw_event가 action_data에 없습니다. 재시도 확인 불가")
         return False
-        
+    
+    # 헤더 정보 추출
     headers = action_data.get('raw_event', {}).get('headers', {})
-    return 'x-slack-retry-num' in headers or 'X-Slack-Retry-Num' in headers
+    
+    # 전체 헤더 로깅 (디버깅 목적)
+    logger.info(f"Slack 요청 헤더: {json.dumps(headers)}")
+    
+    # 대소문자 구분 없이 재시도 헤더 확인 (다양한 형태로 올 수 있음)
+    retry_header = None
+    for header_key in headers:
+        if header_key.lower() == 'x-slack-retry-num':
+            retry_header = headers[header_key]
+            logger.info(f"Slack 재시도 헤더 감지: {header_key}={retry_header}")
+            break
+    
+    is_retry = retry_header is not None
+    
+    if is_retry:
+        logger.info(f"Slack 재시도 요청 감지: 재시도 횟수={retry_header}")
+    
+    return is_retry
 
 def process_action(action_data):
     """
@@ -275,6 +294,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         volume_id = parameters.get('volume_id')
         action_type = parameters.get('action_type')
         region = parameters.get('region')
+        message_ts = parameters.get('message_ts', thread_ts)  # 메시지 타임스탬프 추출
         
         if not volume_id or not action_type:
             return {
@@ -284,15 +304,15 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         
         logger.info(f"볼륨 {volume_id}에 {action_type} 액션 실행 시작")
         
-        # 실행 전 Slack 알림
-        if channel_id:
-            # 스레드에 알림 메시지 전송
-            send_slack_message(
-                channel_id,
-                f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 시작되었습니다. 요청자: <@{requested_by}>",
-                SLACK_BOT_TOKEN,
-                thread_ts  # 스레드가 있는 경우 스레드에 메시지 전송
-            )
+        # 실행 전 Slack 알림 (새 메시지 작성 대신, 바로 업데이트하기 위해 이 부분 주석 처리)
+        # if channel_id:
+        #    # 스레드에 알림 메시지 전송
+        #    send_slack_message(
+        #        channel_id,
+        #        f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 시작되었습니다. 요청자: <@{requested_by}>",
+        #        SLACK_BOT_TOKEN,
+        #        thread_ts  # 스레드가 있는 경우 스레드에 메시지 전송
+        #    )
         
         # 먼저 볼륨 상태 확인
         analyzer = EBSAnalyzer(region)
@@ -301,9 +321,17 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         if not volume_info or 'error' in volume_info:
             error_msg = volume_info.get('error', '볼륨 정보를 가져올 수 없습니다.')
             
-            # 오류 알림
-            if channel_id:
-                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN, thread_ts)
+            # 오류 알림 - 기존 메시지 업데이트
+            if channel_id and message_ts:
+                update_analysis_result_message(
+                    {'success': False, 'error': error_msg},
+                    volume_id,
+                    action_type,
+                    channel_id,
+                    requested_by,
+                    SLACK_BOT_TOKEN,
+                    message_ts
+                )
             
             return {
                 "success": False,
@@ -319,29 +347,49 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         else:
             result = executor.execute_overprovisioned_volume_recommendation(volume_info, action_type)
         
-        # 결과 알림
-        if channel_id:
-            # 실행 결과를 포맷팅하여 Slack으로 전송 (같은 스레드에)
-            send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN, thread_ts)
+        # 결과 알림 - 기존 메시지 업데이트
+        if channel_id and message_ts:
+            # 실행 결과로 원래 메시지 업데이트
+            update_result = update_analysis_result_message(
+                result,
+                volume_id,
+                action_type,
+                channel_id,
+                requested_by,
+                SLACK_BOT_TOKEN,
+                message_ts
+            )
+            logger.info(f"메시지 업데이트 결과: {update_result}")
         
         return {
             "success": True,
             "message": f"볼륨 {volume_id}에 대한 {action_type} 액션이 완료되었습니다.",
             "result": result,
-            "thread_ts": thread_ts  # thread_ts를 반환값에 포함
+            "message_ts": message_ts  # message_ts를 반환값에 포함
         }
     
     except Exception as e:
         logger.error(f"볼륨 액션 실행 중 오류 발생: {str(e)}", exc_info=True)
         
-        # 오류 발생 시 Slack 알림
-        if channel_id:
+        # 오류 발생 시 Slack 알림 - 기존 메시지 업데이트
+        if channel_id and parameters.get('message_ts'):
+            update_analysis_result_message(
+                {'success': False, 'error': str(e)},
+                parameters.get('volume_id', 'unknown'),
+                parameters.get('action_type', 'unknown'),
+                channel_id,
+                requested_by,
+                SLACK_BOT_TOKEN,
+                parameters.get('message_ts')
+            )
+        elif channel_id and thread_ts:
+            # 메시지 타임스탬프가 없는 경우 스레드에 메시지 전송
             send_slack_message(
                 channel_id,
                 f"볼륨 `{parameters.get('volume_id', 'unknown')}`에 대한 `{parameters.get('action_type', 'unknown')}` "
                 f"액션 실행 중 오류가 발생했습니다: {str(e)}",
                 SLACK_BOT_TOKEN,
-                thread_ts  # 스레드가 있는 경우 같은 스레드에 오류 메시지 전송
+                thread_ts
             )
         
         return {

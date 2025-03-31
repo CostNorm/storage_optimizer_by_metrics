@@ -216,6 +216,23 @@ def handle_slack_request_initial(event, context):
     # 2. 간단한 Slack 요청 유효성 검증 (최소한의 검증만 수행)
     # 상세 검증은 실제 처리 단계에서 수행
     headers = event.get("headers", {})
+    
+    # 전체 헤더 정보 로깅 (디버깅 목적)
+    logger.info(f"Slack 요청 헤더: {json.dumps(headers)}")
+    
+    # 재시도 요청인지 확인
+    is_retry, retry_count = check_slack_retry_header(headers)
+    if is_retry:
+        logger.info(f"Slack 재시도 요청 감지 - 초기 응답 단계: 재시도 횟수={retry_count}")
+        # 재시도 요청은 즉시 응답으로 처리 (비동기 처리 건너뜀)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "response_type": "ephemeral",
+                "text": "요청이 이미 처리 중입니다..."
+            })
+        }
+    
     if not (headers.get('x-slack-signature') or headers.get('X-Slack-Signature')):
         logger.error("Slack 서명이 없습니다.")
         return {
@@ -271,6 +288,16 @@ def process_slack_request_async(event, context):
     logger.info("비동기 모드에서 Slack 요청 처리 시작")
     
     try:
+        # 헤더 확인
+        headers = event.get("headers", {})
+        
+        # 재시도 요청인지 확인
+        is_retry, retry_count = check_slack_retry_header(headers)
+        if is_retry:
+            logger.info(f"Slack 재시도 요청 감지 - 비동기 처리 단계: 재시도 횟수={retry_count}")
+            # 재시도 요청은 처리하지 않고 종료
+            return {"statusCode": 200, "body": json.dumps({"message": "Ignoring retry request"})}
+        
         # 1. Slack 요청 검증 (자세한 검증)
         is_valid = validate_slack_request(event)
         if not is_valid:
@@ -394,6 +421,7 @@ def handle_sqs_message(event, context):
         "processed": 0,
         "succeeded": 0,
         "failed": 0,
+        "skipped": 0,
         "details": []
     }
     
@@ -404,6 +432,8 @@ def handle_sqs_message(event, context):
             "statusCode": 400,
             "body": "No SQS records in event"
         }
+
+    sqs = boto3.client('sqs')
         
     for record in event['Records']:
         logger.info(f"메시지 처리 중: {record['messageId']}")
@@ -412,10 +442,22 @@ def handle_sqs_message(event, context):
             # 메시지 본문에서 액션 데이터 추출
             action_data = json.loads(record['body'])
             
-            # Slack 재시도 메시지인 경우 건너뜀 (중복 처리 방지)
-            print("action_data: ", action_data)
+            # Slack 재시도 메시지인 경우 건너뛰고 메시지 삭제
             if is_retry_request(action_data):
                 logger.info(f"Slack 재시도 요청 감지, 메시지 건너뜀: {record['messageId']}")
+                
+                # SQS 메시지 즉시 삭제
+                try:
+                    sqs.delete_message(
+                        QueueUrl=SQS_QUEUE_URL, 
+                        ReceiptHandle=record['receiptHandle']
+                    )
+                    logger.info(f"Slack 재시도 요청 메시지 삭제 완료: {record['messageId']}")
+                except Exception as del_err:
+                    logger.error(f"메시지 삭제 중 오류 발생: {str(del_err)}")
+                
+                results["skipped"] += 1
+                results["processed"] += 1
                 results["details"].append({
                     "message_id": record['messageId'],
                     "status": "skipped",
@@ -882,31 +924,25 @@ def validate_slack_request(event):
 
 def parse_slack_request(body):
     """
-    Slack 요청을 파싱하여 액션 데이터로 변환합니다.
+    Slack 요청 본문을 파싱합니다.
     
-    :param body: Slack 요청 본문
-    :return: 액션 데이터 딕셔너리
+    :param body: 요청 본문
+    :return: 액션 데이터
     """
-    action_data = {
-        "event_type": "slack_interaction",
-        "timestamp": int(time.time())
-    }
+    action_data = {}
     
-    # 이벤트 유형에 따른 기본 분석
-    if "payload" in body:
-        # 인터랙티브 컴포넌트(버튼 클릭 등)
-        payload = json.loads(parse_qs(body)['payload'][0])
-        action_data["interaction_type"] = "interactive_component"
-        action_data["payload"] = payload
-        
-        # 버튼 액션 등을 식별하여 ActionType 설정
-        if payload.get('type') == 'block_actions' and payload.get('actions'):
-            action_id = payload['actions'][0].get('action_id', '')
+    try:
+        if "payload" in body:
+            # 인터랙티브 컴포넌트(버튼 클릭 등)
+            payload = json.loads(parse_qs(body)['payload'][0])
+            
+            action_id = payload.get('actions', [{}])[0].get('action_id', '')
+            
             if action_id.startswith('execute_'):
                 action_data["action_type"] = action_id.replace('execute_', '')
                 
                 # 액션 파라미터 추출
-                action_data["parameters"] = json.loads(payload['actions'][0].get('value', '{}'))
+                button_value = json.loads(payload['actions'][0].get('value', '{}'))
                 
                 # 사용자 및 채널 정보 추가
                 action_data["requested_by"] = payload.get('user', {}).get('id', 'unknown')
@@ -924,26 +960,37 @@ def parse_slack_request(body):
                 # 그렇지 않은 경우 message_ts를 스레드 시작점으로 사용
                 action_data["thread_ts"] = thread_ts or message_ts
                 
+                # 버튼이 클릭된 원본 메시지 타임스탬프를 파라미터에 포함
+                button_value['message_ts'] = message_ts
+                
+                logger.info(f"메시지 타임스탬프 추출: message_ts={message_ts}")
                 logger.info(f"스레드 정보 추출: thread_ts={action_data.get('thread_ts')}")
+                
+                # 업데이트된 파라미터 설정
+                action_data["parameters"] = button_value
+        
+        elif "command" in parse_qs(body):
+            # 슬래시 커맨드
+            params = parse_qs(body)
+            command = params.get('command', [''])[0]
+            text = params.get('text', [''])[0]
+            
+            action_data["interaction_type"] = "slash_command"
+            action_data["command"] = command
+            action_data["text"] = text
+            action_data["action_type"] = "slash_command"
+            
+            # 사용자 및 채널 정보 추가
+            action_data["requested_by"] = params.get('user_id', ['unknown'])[0]
+            action_data["channel_id"] = params.get('channel_id', [''])[0]
+            action_data["response_url"] = params.get('response_url', [''])[0]
+            
+            # 명령어 파싱
+            action_data["parameters"] = parse_command_parameters(text)
     
-    elif "command" in parse_qs(body):
-        # 슬래시 커맨드
-        params = parse_qs(body)
-        command = params.get('command', [''])[0]
-        text = params.get('text', [''])[0]
-        
-        action_data["interaction_type"] = "slash_command"
-        action_data["command"] = command
-        action_data["text"] = text
-        action_data["action_type"] = "slash_command"
-        
-        # 사용자 및 채널 정보 추가
-        action_data["requested_by"] = params.get('user_id', ['unknown'])[0]
-        action_data["channel_id"] = params.get('channel_id', [''])[0]
-        action_data["response_url"] = params.get('response_url', [''])[0]
-        
-        # 명령어 파싱
-        action_data["parameters"] = parse_command_parameters(text)
+    except Exception as e:
+        logger.error(f"Slack 요청 파싱 중 오류: {str(e)}", exc_info=True)
+        action_data["error"] = str(e)
     
     return action_data
 
@@ -1016,10 +1063,25 @@ def is_retry_request(action_data):
     :return: 재시도 여부
     """
     if 'raw_event' not in action_data:
+        logger.warning("raw_event가 action_data에 없습니다. 재시도 확인 불가")
         return False
         
+    # 헤더 정보 추출
     headers = action_data.get('raw_event', {}).get('headers', {})
-    return 'x-slack-retry-num' in headers or 'X-Slack-Retry-Num' in headers
+    
+    # 전체 헤더 로깅 (디버깅 목적)
+    logger.info(f"Slack 요청 헤더: {json.dumps(headers)}")
+    
+    # 대소문자 구분 없이 재시도 헤더 확인
+    # x-slack-retry-num 또는 X-Slack-Retry-Num 등 다양한 형태로 올 수 있음
+    retry_count = None  # 초기화 추가
+    for header_key in headers:
+        if header_key.lower() == 'x-slack-retry-num':
+            retry_count = headers[header_key]
+            logger.info(f"Slack 재시도 헤더 감지: {header_key}={retry_count}")
+            break
+    
+    return retry_count is not None
 
 def process_action(action_data):
     """
@@ -1279,6 +1341,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         volume_id = parameters.get('volume_id')
         action_type = parameters.get('action_type')
         region = parameters.get('region')
+        message_ts = parameters.get('message_ts')  # 메시지 타임스탬프 추출
         
         if not volume_id or not action_type:
             return {
@@ -1288,8 +1351,8 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         
         logger.info(f"볼륨 {volume_id}에 {action_type} 액션 실행 시작")
         
-        # 실행 진행 알림은 스레드에 표시
-        if channel_id and thread_ts:
+        # 실행 진행 알림은 스레드에 표시 (메시지 타임스탬프가 없는 경우에만)
+        if channel_id and thread_ts and not message_ts:
             send_slack_message(
                 channel_id,
                 f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행이 진행 중입니다...",
@@ -1304,9 +1367,23 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         if not volume_info or 'error' in volume_info:
             error_msg = volume_info.get('error', '볼륨 정보를 가져올 수 없습니다.')
             
-            # 오류 알림은 스레드에 표시
-            if channel_id and thread_ts:
-                send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN, thread_ts)
+            # 오류 알림 - 원본 메시지 업데이트 또는 스레드에 메시지
+            if channel_id:
+                if message_ts:
+                    # 원본 메시지 업데이트
+                    from integrations.slack.slack_messenger import update_analysis_result_message
+                    update_analysis_result_message(
+                        {'success': False, 'error': error_msg},
+                        volume_id,
+                        action_type,
+                        channel_id,
+                        requested_by,
+                        SLACK_BOT_TOKEN,
+                        message_ts
+                    )
+                elif thread_ts:
+                    # 스레드에 메시지 전송
+                    send_slack_message(channel_id, f"오류: {error_msg}", SLACK_BOT_TOKEN, thread_ts)
             
             return {
                 "success": False,
@@ -1322,20 +1399,34 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         else:
             result = executor.execute_overprovisioned_volume_recommendation(volume_info, action_type)
         
-        # 결과 알림 - 실행 결과는 메인 채팅에 표시하고 세부 정보는 스레드에 표시
+        # 결과 알림 - 원본 메시지 업데이트 또는 스레드에 결과 표시
         if channel_id:
-            # 기본 실행 결과는 메인 채팅에 표시
-            action_name = action_type.replace('_', ' ').title()
-            success = result.get('success', False)
-            
-            # 메인 채팅에 결과 메시지 표시
-            message = f"볼륨 `{volume_id}`에 대한 `{action_name}` 액션이 {('성공적으로 완료' if success else '실패')}되었습니다."
-            send_slack_message(channel_id, message, SLACK_BOT_TOKEN)
-            
-            # 세부 결과는 스레드에 표시
-            if thread_ts:
-                send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, SLACK_BOT_TOKEN, thread_ts)
-        
+            if message_ts:
+                # 원본 메시지 업데이트
+                from integrations.slack.slack_messenger import update_analysis_result_message
+                update_result = update_analysis_result_message(
+                    result,
+                    volume_id,
+                    action_type,
+                    channel_id,
+                    requested_by,
+                    SLACK_BOT_TOKEN,
+                    message_ts
+                )
+                logger.info(f"메시지 업데이트 결과: {update_result}")
+            elif thread_ts:
+                # 기존 방식으로 스레드에 결과 메시지 전송
+                from integrations.slack.slack_messenger import send_execution_result_to_slack
+                send_execution_result_to_slack(
+                    result, 
+                    volume_id, 
+                    action_type, 
+                    channel_id, 
+                    requested_by, 
+                    SLACK_BOT_TOKEN, 
+                    thread_ts
+                )
+                
         return {
             "success": True,
             "message": f"볼륨 {volume_id}에 대한 {action_type} 액션이 완료되었습니다.",
@@ -1345,15 +1436,30 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
     except Exception as e:
         logger.error(f"볼륨 액션 실행 중 오류 발생: {str(e)}", exc_info=True)
         
-        # 오류 발생 시 Slack 알림
-        if channel_id and thread_ts:
-            send_slack_message(
-                channel_id,
-                f"볼륨 `{parameters.get('volume_id', 'unknown')}`에 대한 `{parameters.get('action_type', 'unknown')}` "
-                f"액션 실행 중 오류가 발생했습니다: {str(e)}",
-                SLACK_BOT_TOKEN,
-                thread_ts
-            )
+        # 오류 발생 시 Slack 알림 - 원본 메시지 업데이트 또는 스레드에 메시지
+        if channel_id:
+            message_ts = parameters.get('message_ts')
+            if message_ts:
+                # 원본 메시지 업데이트
+                from integrations.slack.slack_messenger import update_analysis_result_message
+                update_analysis_result_message(
+                    {'success': False, 'error': str(e)},
+                    parameters.get('volume_id', 'unknown'),
+                    parameters.get('action_type', 'unknown'),
+                    channel_id,
+                    requested_by,
+                    SLACK_BOT_TOKEN,
+                    message_ts
+                )
+            elif thread_ts:
+                # 스레드에 메시지 전송
+                send_slack_message(
+                    channel_id,
+                    f"볼륨 `{parameters.get('volume_id', 'unknown')}`에 대한 `{parameters.get('action_type', 'unknown')}` "
+                    f"액션 실행 중 오류가 발생했습니다: {str(e)}",
+                    SLACK_BOT_TOKEN,
+                    thread_ts
+                )
         
         return {
             "success": False,
@@ -1436,6 +1542,34 @@ def process_volume_action(action_type, parameters, requested_by, channel_id, res
         'region': region,
         'action_type': action_subtype
     }, requested_by, channel_id, response_url, thread_ts)
+
+def check_slack_retry_header(headers):
+    """
+    Slack의 재시도 요청 헤더를 확인합니다.
+    
+    :param headers: 요청 헤더
+    :return: (재시도 여부, 재시도 횟수)
+    """
+    retry_count = None
+    
+    # 대소문자 구분 없이 재시도 헤더 확인
+    for header_key in headers:
+        if header_key.lower() == 'x-slack-retry-num':
+            retry_count = headers[header_key]
+            logger.info(f"Slack 재시도 헤더 감지: {header_key}={retry_count}")
+            break
+    
+    # 헤더 값을 정수로 변환 시도
+    if retry_count is not None:
+        try:
+            retry_count = int(retry_count)
+        except ValueError:
+            logger.warning(f"재시도 횟수를 정수로 변환할 수 없습니다: {retry_count}")
+            retry_count = -1  # 변환 실패 시 임의의 값으로 설정
+    
+    is_retry = retry_count is not None
+    
+    return is_retry, retry_count
 
 # Lambda 함수 진입점
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class EBSActionExecutor:
     def create_snapshot(self, volume_id, description=None, tags=None):
         """
         EBS 볼륨의 스냅샷을 생성합니다.
+        스냅샷 생성은 비동기적으로 처리됩니다 - 생성 요청만 전송하고 완료를 기다리지 않습니다.
         
         :param volume_id: 스냅샷을 생성할 볼륨 ID
         :param description: 스냅샷 설명 (기본값: None)
@@ -47,10 +48,14 @@ class EBSActionExecutor:
             response = self.ec2_client.create_snapshot(**create_args)
             
             snapshot_id = response.get('SnapshotId')
-            logger.info(f"볼륨 {volume_id}의 스냅샷 {snapshot_id} 생성 요청 완료")
+            logger.info(f"볼륨 {volume_id}의 스냅샷 {snapshot_id} 생성 요청 완료. 스냅샷 생성은 백그라운드에서 계속됩니다.")
             
-            # 스냅샷 생성이 진행 중임을 확인
-            self._wait_for_snapshot_started(snapshot_id)
+            # 스냅샷 생성이 시작되었는지만 확인하고 더 기다리지 않음
+            try:
+                self.ec2_client.describe_snapshots(SnapshotIds=[snapshot_id])
+                logger.info(f"스냅샷 {snapshot_id} 생성 요청 확인됨. 완료까지 시간이 소요될 수 있습니다.")
+            except Exception as e:
+                logger.warning(f"스냅샷 {snapshot_id} 상태 확인 중 문제 발생: {str(e)}")
             
             return snapshot_id
             
@@ -58,33 +63,10 @@ class EBSActionExecutor:
             logger.error(f"스냅샷 생성 중 오류 발생: {str(e)}")
             return None
     
-    def _wait_for_snapshot_started(self, snapshot_id, timeout_seconds=30):
-        """
-        스냅샷 생성이 시작되었는지 확인합니다.
-        
-        :param snapshot_id: 스냅샷 ID
-        :param timeout_seconds: 타임아웃(초)
-        :return: 성공 여부
-        """
-        start_time = time.time()
-        while (time.time() - start_time) < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_snapshots(SnapshotIds=[snapshot_id])
-                if response['Snapshots']:
-                    logger.info(f"스냅샷 {snapshot_id} 생성 상태: {response['Snapshots'][0].get('State', '알 수 없음')}, "
-                               f"진행률: {response['Snapshots'][0].get('Progress', '0%')}")
-                    return True
-            except Exception as e:
-                logger.warning(f"스냅샷 {snapshot_id} 상태 확인 중 오류: {str(e)}")
-            
-            time.sleep(5)
-        
-        logger.warning(f"스냅샷 {snapshot_id} 시작 확인 타임아웃")
-        return False
-    
     def detach_volume(self, volume_id, force=False):
         """
         EBS 볼륨을 인스턴스에서 분리합니다.
+        분리 요청만 보내고 완료를 기다리지 않습니다.
         
         :param volume_id: 분리할 볼륨 ID
         :param force: 강제 분리 여부 (기본값: False)
@@ -119,9 +101,7 @@ class EBSActionExecutor:
                     detach_args['Force'] = True
                 
                 self.ec2_client.detach_volume(**detach_args)
-                
-                # 분리가 완료될 때까지 대기
-                self._wait_for_volume_detachment(volume_id, timeout_seconds=120)
+                logger.info(f"볼륨 {volume_id} 분리 요청 완료. 분리는 백그라운드에서 계속됩니다.")
             
             return True
             
@@ -129,53 +109,10 @@ class EBSActionExecutor:
             logger.error(f"볼륨 분리 중 오류 발생: {str(e)}")
             return False
     
-    def _wait_for_volume_detachment(self, volume_id, timeout_seconds=120):
-        """
-        볼륨이 완전히 분리될 때까지 기다립니다.
-        
-        :param volume_id: 볼륨 ID
-        :param timeout_seconds: 타임아웃(초)
-        :return: 성공 여부
-        """
-        start_time = time.time()
-        logger.info(f"볼륨 {volume_id} 분리 완료 대기 시작")
-        
-        while (time.time() - start_time) < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
-                
-                if not response['Volumes']:
-                    logger.warning(f"볼륨 {volume_id}을 찾을 수 없습니다.")
-                    return False
-                    
-                volume = response['Volumes'][0]
-                state = volume.get('State')
-                attachments = volume.get('Attachments', [])
-                
-                logger.info(f"볼륨 {volume_id} 상태: {state}, 연결 수: {len(attachments)}")
-                
-                # 연결된 인스턴스가 없고 상태가 'available'이면 분리 완료
-                if not attachments and state == 'available':
-                    logger.info(f"볼륨 {volume_id} 분리 완료")
-                    return True
-                    
-                # 특정 상태에서는 더 이상 기다릴 필요 없음
-                if state in ['error', 'deleted']:
-                    logger.error(f"볼륨 {volume_id}이 예기치 않은 상태({state})입니다.")
-                    return False
-                    
-                time.sleep(5)  # 5초 대기 후 다시 확인
-                
-            except ClientError as e:
-                logger.warning(f"볼륨 상태 확인 중 오류 발생: {str(e)}")
-                time.sleep(5)
-        
-        logger.warning(f"볼륨 {volume_id} 분리 대기 시간 초과 ({timeout_seconds}초)")
-        return False
-    
     def attach_volume(self, volume_id, instance_id, device):
         """
         EBS 볼륨을 인스턴스에 연결합니다.
+        연결 요청을 보내고 완료되기를 기다리지 않습니다.
         
         :param volume_id: 연결할 볼륨 ID
         :param instance_id: 인스턴스 ID
@@ -216,84 +153,42 @@ class EBSActionExecutor:
                 Device=device
             )
             
-            # 볼륨 연결 완료 대기
-            return self.wait_for_volume_attachment(volume_id, instance_id)
+            logger.info(f"볼륨 {volume_id}의 인스턴스 {instance_id} 연결 요청 완료. 연결은 백그라운드에서 계속됩니다.")
+            return True
             
         except ClientError as e:
             logger.error(f"볼륨 연결 중 오류 발생: {str(e)}")
             return False
     
-    def wait_for_volume_attachment(self, volume_id, instance_id, timeout_seconds=300, check_interval=5):
-        """
-        볼륨 연결 완료를 대기합니다.
-        
-        :param volume_id: 볼륨 ID
-        :param instance_id: 인스턴스 ID
-        :param timeout_seconds: 최대 대기 시간 (초)
-        :param check_interval: 상태 확인 간격 (초)
-        :return: 성공 여부 (boolean)
-        """
-        logger.info(f"볼륨 {volume_id}의 인스턴스 {instance_id} 연결 완료 대기 중...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
-                
-                if response['Volumes'] and response['Volumes'][0]['Attachments']:
-                    attachment = response['Volumes'][0]['Attachments'][0]
-                    
-                    if attachment['InstanceId'] == instance_id and attachment['State'] == 'attached':
-                        logger.info(f"볼륨 {volume_id}가 인스턴스 {instance_id}에 성공적으로 연결되었습니다.")
-                        return True
-                    
-                    logger.info(f"볼륨 연결 상태: {attachment['State']}")
-                
-                time.sleep(check_interval)
-                
-            except ClientError as e:
-                logger.error(f"볼륨 상태 확인 중 오류 발생: {str(e)}")
-                return False
-        
-        logger.warning(f"볼륨 {volume_id} 연결 대기 시간이 초과되었습니다.")
-        return False
-    
     def delete_volume(self, volume_id):
         """
         EBS 볼륨을 삭제합니다.
+        삭제 요청만 보내고 완료를 기다리지 않습니다.
         
         :param volume_id: 삭제할 볼륨 ID
         :return: 성공 여부 (boolean)
         """
         try:
+            # 볼륨 정보 확인 (볼륨이 존재하는지, 연결되지 않았는지 확인)
+            try:
+                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
+                
+                if not response['Volumes']:
+                    logger.error(f"볼륨 {volume_id}을 찾을 수 없습니다.")
+                    return False
+                
+                if response['Volumes'][0]['Attachments']:
+                    logger.warning(f"볼륨 {volume_id}가 아직 인스턴스에 연결되어 있습니다. 분리 후 삭제해야 합니다.")
+                    # 여기서는 경고만 하고 계속 진행, AWS API가 알아서 오류를 반환할 것임
+            except Exception as e:
+                logger.error(f"볼륨 {volume_id} 정보 조회 중 오류: {str(e)}")
+                return False
+                
             logger.info(f"볼륨 {volume_id} 삭제 시작")
             self.ec2_client.delete_volume(VolumeId=volume_id)
+            logger.info(f"볼륨 {volume_id} 삭제 요청 완료. 삭제는 백그라운드에서 계속됩니다.")
             
-            # 볼륨이 삭제되었는지 확인
-            for _ in range(12):  # 60초 동안 최대 12번 시도
-                try:
-                    volumes = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
-                    state = volumes['Volumes'][0]['State'] if volumes['Volumes'] else None
-                    logger.info(f"볼륨 {volume_id} 상태: {state}")
-                    
-                    # 볼륨이 삭제 중이면 대기
-                    if state == 'deleting':
-                        logger.info(f"볼륨 {volume_id} 삭제 중...")
-                    else:
-                        logger.warning(f"볼륨 {volume_id}이 예기치 않은 상태({state})입니다.")
-                        
-                except Exception as e:
-                    # VolumeNotFound 예외는 삭제 성공의 신호
-                    if 'VolumeNotFound' in str(e):
-                        logger.info(f"볼륨 {volume_id} 삭제 확인됨")
-                        return True
-                    logger.warning(f"볼륨 {volume_id} 상태 확인 중 오류: {str(e)}")
-                
-                time.sleep(5)
-                
-            # 확인 타임아웃이지만 삭제 요청은 성공했으므로 성공으로 처리
-            logger.info(f"볼륨 {volume_id} 삭제 요청 성공, 삭제 확인 타임아웃")
+            # 바로 성공으로 처리
             return True
             
         except ClientError as e:
@@ -346,6 +241,8 @@ class EBSActionExecutor:
             modification = response.get('VolumeModification', {})
             start_state = modification.get('ModificationState')
             
+            logger.info(f"볼륨 타입 변경 요청 완료. 변경은 백그라운드에서 계속됩니다.")
+            
             return {
                 'success': True,
                 'message': f"볼륨 타입 변경 요청 성공: {current_type} -> {target_type}",
@@ -371,142 +268,60 @@ class EBSActionExecutor:
             logger.error(f"볼륨 {volume_id} 정보 조회 중 오류: {str(e)}")
             return None
     
-    def wait_for_snapshot_completion(self, snapshot_id, timeout_seconds=300, check_interval=15):
+    def check_snapshot_status(self, snapshot_id):
         """
-        스냅샷 생성 완료를 대기합니다.
+        스냅샷 상태를 확인합니다.
         
         :param snapshot_id: 스냅샷 ID
-        :param timeout_seconds: 최대 대기 시간 (초)
-        :param check_interval: 상태 확인 간격 (초)
-        :return: 성공 여부 (boolean)
+        :return: 상태 정보 딕셔너리
         """
-        logger.info(f"스냅샷 {snapshot_id} 생성 완료 대기 중...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_snapshots(SnapshotIds=[snapshot_id])
-                if response['Snapshots']:
-                    state = response['Snapshots'][0]['State']
-                    progress = response['Snapshots'][0].get('Progress', 'N/A')
-                    
-                    if state == 'completed':
-                        logger.info(f"스냅샷 {snapshot_id} 생성이 완료되었습니다.")
-                        return True
-                    
-                    logger.info(f"스냅샷 상태: {state}, 진행률: {progress}")
-                    
-                time.sleep(check_interval)
-                
-            except ClientError as e:
-                logger.error(f"스냅샷 상태 확인 중 오류 발생: {str(e)}")
-                return False
-        
-        logger.warning(f"스냅샷 {snapshot_id} 생성 대기 시간이 초과되었습니다.")
-        return False
+        try:
+            response = self.ec2_client.describe_snapshots(SnapshotIds=[snapshot_id])
+            if response['Snapshots']:
+                snapshot = response['Snapshots'][0]
+                return {
+                    'state': snapshot['State'],
+                    'progress': snapshot.get('Progress', 'N/A'),
+                    'start_time': snapshot.get('StartTime', 'N/A'),
+                    'volume_id': snapshot.get('VolumeId', 'N/A'),
+                    'volume_size': snapshot.get('VolumeSize', 'N/A')
+                }
+            return {'error': '스냅샷을 찾을 수 없습니다.'}
+        except ClientError as e:
+            return {'error': f"스냅샷 상태 확인 중 오류: {str(e)}"}
     
-    def wait_for_volume_detachment(self, volume_id, timeout_seconds=300, check_interval=5):
+    def check_volume_status(self, volume_id):
         """
-        볼륨 분리 완료를 대기합니다.
+        볼륨 상태를 확인합니다.
         
         :param volume_id: 볼륨 ID
-        :param timeout_seconds: 최대 대기 시간 (초)
-        :param check_interval: 상태 확인 간격 (초)
-        :return: 성공 여부 (boolean)
+        :return: 상태 정보 딕셔너리
         """
-        logger.info(f"볼륨 {volume_id} 분리 완료 대기 중...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
+        try:
+            response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
+            if response['Volumes']:
+                volume = response['Volumes'][0]
+                attachments = volume.get('Attachments', [])
+                attach_info = []
                 
-                if response['Volumes']:
-                    state = response['Volumes'][0]['State']
-                    has_attachments = bool(response['Volumes'][0]['Attachments'])
-                    
-                    if state == 'available' and not has_attachments:
-                        logger.info(f"볼륨 {volume_id} 분리가 완료되었습니다.")
-                        return True
-                    
-                    logger.info(f"볼륨 상태: {state}, 연결 여부: {has_attachments}")
+                for attachment in attachments:
+                    attach_info.append({
+                        'instance_id': attachment.get('InstanceId'),
+                        'device': attachment.get('Device'),
+                        'state': attachment.get('State')
+                    })
                 
-                time.sleep(check_interval)
-                
-            except ClientError as e:
-                logger.error(f"볼륨 상태 확인 중 오류 발생: {str(e)}")
-                return False
-        
-        logger.warning(f"볼륨 {volume_id} 분리 대기 시간이 초과되었습니다.")
-        return False
-    
-    def wait_for_volume_attachment(self, volume_id, instance_id, timeout_seconds=300, check_interval=5):
-        """
-        볼륨 연결 완료를 대기합니다.
-        
-        :param volume_id: 볼륨 ID
-        :param instance_id: 인스턴스 ID
-        :param timeout_seconds: 최대 대기 시간 (초)
-        :param check_interval: 상태 확인 간격 (초)
-        :return: 성공 여부 (boolean)
-        """
-        logger.info(f"볼륨 {volume_id}의 인스턴스 {instance_id} 연결 완료 대기 중...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
-                
-                if response['Volumes'] and response['Volumes'][0]['Attachments']:
-                    attachment = response['Volumes'][0]['Attachments'][0]
-                    
-                    if attachment['InstanceId'] == instance_id and attachment['State'] == 'attached':
-                        logger.info(f"볼륨 {volume_id}가 인스턴스 {instance_id}에 성공적으로 연결되었습니다.")
-                        return True
-                    
-                    logger.info(f"볼륨 연결 상태: {attachment['State']}")
-                
-                time.sleep(check_interval)
-                
-            except ClientError as e:
-                logger.error(f"볼륨 상태 확인 중 오류 발생: {str(e)}")
-                return False
-        
-        logger.warning(f"볼륨 {volume_id} 연결 대기 시간이 초과되었습니다.")
-        return False
-    
-    def wait_for_volume_deletion(self, volume_id, timeout_seconds=180, check_interval=5):
-        """
-        볼륨 삭제 완료를 대기합니다.
-        
-        :param volume_id: 볼륨 ID
-        :param timeout_seconds: 최대 대기 시간 (초)
-        :param check_interval: 상태 확인 간격 (초)
-        :return: 성공 여부 (boolean)
-        """
-        logger.info(f"볼륨 {volume_id} 삭제 완료 대기 중...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.ec2_client.describe_volumes(VolumeIds=[volume_id])
-                logger.info(f"볼륨 {volume_id}가 아직 삭제되지 않았습니다.")
-                time.sleep(check_interval)
-                
-            except ClientError as e:
-                if 'InvalidVolume.NotFound' in str(e):
-                    logger.info(f"볼륨 {volume_id}가 성공적으로 삭제되었습니다.")
-                    return True
-                else:
-                    logger.error(f"볼륨 상태 확인 중 오류 발생: {str(e)}")
-                    return False
-        
-        logger.warning(f"볼륨 {volume_id} 삭제 대기 시간이 초과되었습니다.")
-        return False
+                return {
+                    'state': volume['State'],
+                    'attachments': attach_info,
+                    'volume_type': volume.get('VolumeType'),
+                    'size': volume.get('Size'),
+                    'iops': volume.get('Iops', 'N/A'),
+                    'throughput': volume.get('Throughput', 'N/A')
+                }
+            return {'error': '볼륨을 찾을 수 없습니다.'}
+        except ClientError as e:
+            return {'error': f"볼륨 상태 확인 중 오류: {str(e)}"}
     
     def _is_volume_safe_to_detach(self, volume_id, instance_id):
         """

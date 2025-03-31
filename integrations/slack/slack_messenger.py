@@ -162,7 +162,8 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
                 "value": json.dumps({
                     "volume_id": volume_id,
                     "region": result.get('region'),
-                    "action_type": "snapshot_and_delete"
+                    "action_type": "snapshot_and_delete",
+                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
                 }),
                 "action_id": "execute_snapshot_and_delete"  # Changed from execute_idle_volume_action to be unique
             })
@@ -177,7 +178,8 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
                 "value": json.dumps({
                     "volume_id": volume_id,
                     "region": result.get('region'),
-                    "action_type": "snapshot_only"
+                    "action_type": "snapshot_only",
+                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
                 }),
                 "action_id": "execute_snapshot_only"  # Changed from execute_idle_volume_action to be unique
             })
@@ -193,7 +195,8 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
                 "value": json.dumps({
                     "volume_id": volume_id,
                     "region": result.get('region'),
-                    "action_type": "resize"
+                    "action_type": "resize",
+                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
                 }),
                 "action_id": "execute_resize"  # Changed from execute_overprovisioned_volume_action for consistency
             })
@@ -230,8 +233,43 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
             logger.error(f"Slack 메시지 전송 실패: {response.status_code} {response.text}")
             return False, None
         
-        # 스레드 식별자 반환 (후속 응답을 스레드로 유지하기 위함)
+        # 메시지 타임스탬프 저장
         ts = response.json().get('ts')
+        
+        # 버튼 값에 메시지 타임스탬프 포함 - 이 부분이 중요합니다!
+        try:
+            if ts and len(blocks) > 0:
+                for block in blocks:
+                    if block.get('type') == 'actions':
+                        for element in block.get('elements', []):
+                            if element.get('type') == 'button' and element.get('action_id', '').startswith('execute_'):
+                                # 버튼 값에서 메시지 타임스탬프 업데이트
+                                button_value = json.loads(element.get('value', '{}'))
+                                button_value['message_ts'] = ts
+                                element['value'] = json.dumps(button_value)
+                                
+                # 업데이트된 블록으로 메시지 업데이트
+                updated_message_json = {
+                    "channel": channel_id,
+                    "ts": ts,
+                    "blocks": blocks,
+                    "text": message_json.get('text', '')
+                }
+                
+                update_response = requests.post(
+                    "https://slack.com/api/chat.update",
+                    headers={
+                        "Authorization": f"Bearer {bot_token}",
+                        "Content-Type": "application/json"
+                    },
+                    json=updated_message_json
+                )
+                
+                if not update_response.json().get('ok', False):
+                    logger.warning(f"버튼 값 업데이트 실패: {update_response.text}")
+        except Exception as e:
+            logger.warning(f"버튼 값 업데이트 중 오류 발생: {str(e)}")
+        
         return True, ts
     
     except Exception as e:
@@ -559,3 +597,129 @@ def send_actions_to_thread(actions, channel_id, bot_token, thread_ts):
         send_slack_message(channel_id, actions_text, bot_token, thread_ts)
     except Exception as e:
         logger.error(f"권장 조치 스레드 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
+
+def update_analysis_result_message(result, volume_id, action_type, channel_id, requested_by, bot_token, message_ts=None):
+    """
+    기존 분석 결과 메시지를 액션 실행 결과로 업데이트합니다.
+    
+    :param result: 실행 결과
+    :param volume_id: 볼륨 ID
+    :param action_type: 액션 유형
+    :param channel_id: Slack 채널 ID 
+    :param requested_by: 요청자 ID
+    :param bot_token: Slack Bot 토큰
+    :param message_ts: 업데이트할 메시지의 타임스탬프
+    :return: 업데이트 성공 여부
+    """
+    # 로그 추가
+    logger.info(f"메시지 업데이트 시작: channel_id={channel_id}, message_ts={message_ts}, action_type={action_type}, volume_id={volume_id}")
+    
+    if not bot_token:
+        logger.warning("SLACK_BOT_TOKEN이 설정되지 않았습니다. Slack 메시지를 업데이트할 수 없습니다.")
+        return False
+    
+    if not message_ts:
+        logger.warning("메시지 타임스탬프가 제공되지 않아 업데이트할 수 없습니다.")
+        return False
+    
+    try:
+        success = result.get('success', False)
+        details = result.get('details', {})
+        
+        # 성공 여부에 따른 아이콘 선택
+        icon = ":white_check_mark:" if success else ":x:"
+        
+        # 액션 타입 이름 형식화
+        action_name = action_type.replace('_', ' ').title()
+        
+        # Block Kit 메시지 구성
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{icon} 볼륨 {volume_id} {action_name} 결과",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*볼륨 ID:*\n{volume_id}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*액션:*\n{action_name}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*요청자:*\n<@{requested_by}>"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*결과:*\n{'성공' if success else '실패'}"
+                    }
+                ]
+            }
+        ]
+        
+        # 실행 세부 정보가 있으면 추가
+        if isinstance(details, dict) and details:
+            detail_text = ""
+            for key, value in details.items():
+                # 스냅샷 ID나 특정 중요 정보는 강조 표시
+                if key.lower() in ['snapshot_id', 'snapshot', 'id']:
+                    detail_text += f"*{key}:* `{value}`\n"
+                else:
+                    detail_text += f"*{key}:* {value}\n"
+            
+            if detail_text:
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*세부 정보:*\n{detail_text}"
+                    }
+                })
+        
+        # 실행 결과 메시지에는 추가 안내 메시지 추가
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "액션이 완료되었습니다. 추가 조치가 필요한 경우 새 분석을 요청하세요."
+                }
+            ]
+        })
+        
+        # 메시지 JSON 구성
+        message_json = {
+            "channel": channel_id,
+            "ts": message_ts,  # 업데이트할 메시지 타임스탬프
+            "blocks": blocks,
+            "text": f"볼륨 {volume_id}에 대한 {action_name} 액션이 {('성공적으로 완료' if success else '실패')}되었습니다."
+        }
+        
+        # Slack API로 메시지 업데이트
+        response = requests.post(
+            "https://slack.com/api/chat.update",  # update API 사용
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json"
+            },
+            json=message_json
+        )
+        
+        if response.status_code != 200 or not response.json().get('ok', False):
+            logger.error(f"Slack 메시지 업데이트 실패: {response.status_code} {response.text}")
+            return False
+        
+        logger.info(f"Slack 메시지 업데이트 성공: channel_id={channel_id}, message_ts={message_ts}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Slack 메시지 업데이트 중 오류 발생: {str(e)}", exc_info=True)
+        return False

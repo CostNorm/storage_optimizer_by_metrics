@@ -42,28 +42,28 @@ def enqueue_action(action_data):
             message_params['MessageDeduplicationId'] = str(uuid.uuid4())
             
             # MessageGroupId 설정 (단일 그룹을 사용하거나 action_type에 따라 그룹화)
-            # ActionType이 있으면 그것을 사용하고, 없으면 action_type을 사용
-            group_id = action_data.get('ActionType', action_data.get('action_type', 'default'))
+            group_id = action_data.get('action_type', 'default')
             message_params['MessageGroupId'] = group_id
+            logger.info(f"FIFO 큐 사용: MessageGroupId={group_id}")
         
-        # ActionType이 있을 경우 action_type으로도 추가 (일관성 유지)
-        if 'ActionType' in action_data and 'action_type' not in action_data:
-            action_data['action_type'] = action_data['ActionType']
-        
-        # MessageAttributes와 본문 모두 일관된 형식으로 설정
-        if 'ActionType' in action_data:
-            message_params['MessageAttributes'] = {
-                'ActionType': {
-                    'DataType': 'String',
-                    'StringValue': action_data['ActionType']
-                }
-            }
-        
+        # SQS에 메시지 전송
         response = sqs_client.send_message(**message_params)
-        
-        logger.info(f"액션이 SQS 큐에 추가되었습니다: {response['MessageId']}")
+        logger.info(f"액션 요청이 SQS 큐에 추가되었습니다: {response.get('MessageId')}")
         return response
-    
+        
     except Exception as e:
-        logger.error(f"액션을 SQS 큐에 추가하는 중 오류 발생: {str(e)}", exc_info=True)
+        logger.error(f"SQS에 액션 요청 추가 중 오류 발생: {str(e)}")
         return False
+
+def get_action_status(message_id):
+    """
+    SQS 메시지의 상태를 확인합니다.
+    
+    :param message_id: SQS 메시지 ID
+    :return: 메시지 상태 또는 None
+    """
+    # 이 기능은 현재 구현되지 않았습니다.
+    # SQS는 메시지 상태를 직접적으로 조회하는 기능을 제공하지 않기 때문에
+    # 별도의 DynamoDB 테이블 등을 사용하여 상태 추적이 필요합니다.
+    logger.warning("메시지 상태 확인 기능은 현재 구현되지 않았습니다.")
+    return None

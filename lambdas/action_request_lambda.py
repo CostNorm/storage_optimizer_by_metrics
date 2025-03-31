@@ -46,6 +46,18 @@ def lambda_handler(event, context):
     :param context: Lambda 컨텍스트
     :return: Slack에 대한 응답
     """
+    # 디버깅 - 전체 이벤트 로깅
+    logger.info(f"받은 이벤트 데이터: {json.dumps(event)}")
+    
+    # 헤더 정보 로깅
+    headers = event.get("headers", {})
+    logger.info(f"요청 헤더: {json.dumps(headers)}")
+    
+    # 재시도 헤더 확인
+    is_retry, retry_count = check_retry_header(headers)
+    if is_retry:
+        logger.info(f"Slack 재시도 요청 감지: 재시도 횟수={retry_count}")
+        
     # 비동기 처리를 위한 내부 호출 여부 확인
     is_async_processing = event.get('__async_processing', False)
     
@@ -55,6 +67,31 @@ def lambda_handler(event, context):
     else:
         # 초기 호출 모드 - 즉시 응답 후 자기 자신을 비동기로 호출
         return handle_initial_request(event, context)
+
+def check_retry_header(headers):
+    """
+    Slack의 재시도 요청 헤더를 확인합니다.
+    
+    :param headers: 요청 헤더
+    :return: (재시도 여부, 재시도 횟수)
+    """
+    retry_count = None
+    
+    # 대소문자 구분 없이 재시도 헤더 확인
+    for header_key in headers:
+        if header_key.lower() == 'x-slack-retry-num':
+            retry_count = headers[header_key]
+            logger.info(f"Slack 재시도 헤더 감지: {header_key}={retry_count}")
+            break
+    
+    # 헤더 값을 정수로 변환 시도
+    if retry_count is not None:
+        try:
+            retry_count = int(retry_count)
+        except ValueError:
+            logger.warning(f"재시도 횟수를 정수로 변환할 수 없습니다: {retry_count}")
+    
+    return retry_count is not None, retry_count
 
 def handle_initial_request(event, context):
     """
@@ -97,6 +134,12 @@ def handle_initial_request(event, context):
         })
     }
     
+    # 재시도 요청인 경우 처리 여부 검토
+    is_retry, retry_count = check_retry_header(headers)
+    if is_retry:
+        logger.info(f"초기 요청 단계에서 Slack 재시도 감지: 재시도 횟수={retry_count}")
+        # 여기서 추가적인 로직을 둘 수 있음 (예: 특정 재시도 횟수에서만 처리)
+    
     # 5. 자기 자신을 비동기적으로 호출하여 실제 처리 수행
     if LAMBDA_FUNCTION_NAME and LAMBDA_CLIENT:
         try:
@@ -130,6 +173,18 @@ def process_event_async(event):
     logger.info("비동기 모드에서 Slack 요청 처리 시작")
     
     try:
+        # 헤더 확인 및 재시도 요청 여부 체크
+        headers = event.get("headers", {})
+        is_retry, retry_count = check_retry_header(headers)
+        
+        if is_retry:
+            logger.info(f"비동기 처리 단계에서 Slack 재시도 감지: 재시도 횟수={retry_count}")
+            # 재시도 요청은 건너뛰기
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "재시도 요청 무시됨", "retry_count": retry_count})
+            }
+        
         # 1. Slack 요청 검증 (자세한 검증)
         is_valid = validate_slack_request(event)
         if not is_valid:
@@ -167,6 +222,14 @@ def process_event_async(event):
                     try:
                         button_value = payload['actions'][0].get('value', '{}')
                         parameters = json.loads(button_value)
+                        
+                        # 원본 메시지의 타임스탬프 추가
+                        container = payload.get('container', {})
+                        message_ts = container.get('message_ts')
+                        if message_ts:
+                            parameters['message_ts'] = message_ts
+                            logger.info(f"원본 메시지 타임스탬프 추가: {message_ts}")
+                        
                         action_data["parameters"] = parameters
                         
                         # 로깅
@@ -198,7 +261,7 @@ def process_event_async(event):
             action_data["response_url"] = params.get('response_url', [''])[0]
         
         # 4. SQS에 메시지 전송
-        logger.info(f"SQS에 전송할 액션 데이터: {action_data}")
+        logger.info(f"SQS에 전송할 액션 데이터: {json.dumps(action_data)}")
         enqueue_result = enqueue_action(action_data)
         
         if not enqueue_result:
@@ -222,8 +285,15 @@ def validate_slack_request(event):
     :return: 검증 성공 여부
     """
     headers = event.get("headers", {})
-    slack_signature = headers.get('x-slack-signature', headers.get('X-Slack-Signature', ''))
-    slack_request_timestamp = headers.get('x-slack-request-timestamp', headers.get('X-Slack-Request-Timestamp', ''))
+    # 대소문자 무관하게 헤더 찾기
+    slack_signature = None
+    slack_request_timestamp = None
+    
+    for key, value in headers.items():
+        if key.lower() == 'x-slack-signature':
+            slack_signature = value
+        elif key.lower() == 'x-slack-request-timestamp':
+            slack_request_timestamp = value
     
     if not slack_signature or not slack_request_timestamp:
         logger.error("Missing Slack signature or timestamp in headers")
