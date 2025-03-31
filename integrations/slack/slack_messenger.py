@@ -2,6 +2,7 @@ import json
 import logging
 import requests
 from datetime import datetime
+import os
 
 logger = logging.getLogger()
 
@@ -88,6 +89,7 @@ def send_slack_error(webhook_url, error_message):
 def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None, use_thread=True):
     """
     분석 결과를 Slack 채널로 전송합니다.
+    (수정: 연결된 유휴 볼륨은 Snapshot only 버튼만 표시)
     
     :param result: 분석 결과
     :param channel_id: Slack 채널 ID
@@ -101,11 +103,12 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
         return False, None
     
     try:
-        # 메시지 구성
         volume_id = result.get('volume_id', 'unknown')
         is_idle = result.get('is_idle', False)
         is_overprovisioned = result.get('is_overprovisioned', False)
         recommendation = result.get('recommendation', '해당 없음')
+        # Check attachment status (Directly use 'attachments' key from result)
+        is_attached = len(result.get('attachments', [])) > 0
         
         status_text = []
         if is_idle:
@@ -147,27 +150,11 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
             }
         ]
         
-        # 상태에 따른 액션 버튼 추가
+        # 상태에 따른 액션 버튼 추가 (조건부 로직 강화)
         actions = []
-        
+
         if is_idle:
-            actions.append({
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "스냅샷 생성 후 삭제",
-                    "emoji": True
-                },
-                "style": "danger",
-                "value": json.dumps({
-                    "volume_id": volume_id,
-                    "region": result.get('region'),
-                    "action_type": "snapshot_and_delete",
-                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
-                }),
-                "action_id": "execute_snapshot_and_delete"  # Changed from execute_idle_volume_action to be unique
-            })
-            
+            # Snapshot only button (always add if idle)
             actions.append({
                 "type": "button",
                 "text": {
@@ -179,11 +166,32 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
                     "volume_id": volume_id,
                     "region": result.get('region'),
                     "action_type": "snapshot_only",
-                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
+                    "message_ts": "" # Placeholder for message ts
                 }),
-                "action_id": "execute_snapshot_only"  # Changed from execute_idle_volume_action to be unique
+                "action_id": "execute_snapshot_only"
             })
-        
+
+            # Snapshot and delete button (only if idle AND not attached)
+            if not is_attached:
+                actions.append({
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "스냅샷 생성 후 삭제",
+                        "emoji": True
+                    },
+                    "style": "danger",
+                    "value": json.dumps({
+                        "volume_id": volume_id,
+                        "region": result.get('region'),
+                        "action_type": "snapshot_and_delete",
+                        "message_ts": "" # Placeholder for message ts
+                    }),
+                    "action_id": "execute_snapshot_and_delete"
+                })
+            else:
+                logger.info(f"볼륨 {volume_id}은(는) 유휴 상태지만 연결되어 있어 삭제 버튼을 제외합니다.")
+
         if is_overprovisioned:
             actions.append({
                 "type": "button",
@@ -196,9 +204,9 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
                     "volume_id": volume_id,
                     "region": result.get('region'),
                     "action_type": "resize",
-                    "message_ts": "" # 이 값은 나중에 response.json().get('ts')로 채워질 것입니다
+                    "message_ts": "" # Placeholder for message ts
                 }),
-                "action_id": "execute_resize"  # Changed from execute_overprovisioned_volume_action for consistency
+                "action_id": "execute_resize"
             })
         
         # 액션 버튼이 있는 경우 추가
@@ -273,7 +281,7 @@ def send_analysis_result_to_slack(result, channel_id, bot_token, thread_ts=None,
         return True, ts
     
     except Exception as e:
-        logger.error(f"Slack 메시지 전송 중 오류 발생: {str(e)}", exc_info=True)
+        logger.error(f"Slack 분석 결과 전송 중 오류 발생: {str(e)}", exc_info=True)
         return False, None
 
 def send_execution_result_to_slack(result, volume_id, action_type, channel_id, requested_by, bot_token, thread_ts=None):
@@ -723,3 +731,301 @@ def update_analysis_result_message(result, volume_id, action_type, channel_id, r
     except Exception as e:
         logger.error(f"Slack 메시지 업데이트 중 오류 발생: {str(e)}", exc_info=True)
         return False
+
+def send_analysis_summary_to_slack(analysis_result, channel_id=None, bot_token=None, webhook_url=None):
+    """
+    EBS 분석 결과 요약 (전체 리전 또는 단일 볼륨)을 Slack으로 전송합니다.
+    (수정: 연결된 유휴 볼륨은 Snapshot only 버튼만 표시)
+
+    :param analysis_result: 전체 분석 결과 (analyze_all_regions 결과) 또는 단일 볼륨 분석 결과
+    :param channel_id: Slack 채널 ID
+    :param bot_token: Slack Bot 토큰
+    :param webhook_url: Slack Incoming Webhook URL (channel/token 없을 시 사용)
+    :return: Slack API 응답 또는 상태 딕셔너리
+    """
+    target_webhook_url = webhook_url or os.environ.get('SLACK_WEBHOOK_URL')
+
+    if not (channel_id and bot_token) and not target_webhook_url:
+        logger.warning("Slack 채널/봇 토큰 또는 웹훅 URL이 없어 요약 알림을 보낼 수 없습니다.")
+        return {"skipped": True, "reason": "No channel/token or webhook URL configured"}
+
+    try:
+        # 결과에서 요약 정보 추출
+        # 단일 볼륨 결과와 전체 결과 형식이 다를 수 있으므로 처리 필요
+        summary = analysis_result.get("summary")
+        is_single_volume = "volume_id" in analysis_result and "summary" not in analysis_result
+        timestamp = analysis_result.get("timestamp", datetime.now().isoformat())
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "EBS 볼륨 최적화 분석 요약",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*분석 완료 시간:* {timestamp}"
+                }
+            }
+        ]
+
+        if is_single_volume:
+            # 단일 볼륨 결과 요약
+            volume_id = analysis_result.get('volume_id')
+            region = analysis_result.get('region')
+            is_idle = analysis_result.get('is_idle')
+            is_over = analysis_result.get('is_overprovisioned')
+            reco = analysis_result.get('recommendation')
+            status_text = []
+            if is_idle: status_text.append("유휴")
+            if is_over: status_text.append("과대 프로비저닝")
+            status = ", ".join(status_text) or "최적"
+
+            blocks.extend([
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*볼륨 ID:*\n`{volume_id}`"},
+                        {"type": "mrkdwn", "text": f"*리전:*\n{region}"},
+                        {"type": "mrkdwn", "text": f"*상태:*\n{status}"},
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*권장 사항:* {reco}"
+                    }
+                }
+            ])
+            summary_text = f"볼륨 `{volume_id}` 분석 요약: 상태={status}, 권장={reco}"
+            # 단일 볼륨 결과에는 액션 버튼을 여기에 추가할 수도 있음 (send_analysis_result_to_slack 과 유사하게)
+            # 예시: 만약 analysis_result["suggested_action"] != "none": ... add action button ...
+            if analysis_result.get("suggested_action") != "none" and analysis_result.get("action_params"):
+                action_params = analysis_result["action_params"]
+                action_type_display = action_params.get('action_type', 'Unknown Action').replace('_',' ').title()
+                blocks.append({
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": f"{action_type_display} 실행",
+                                "emoji": True
+                            },
+                            "style": "danger" if "delete" in action_params.get('action_type','') else "primary",
+                            "value": json.dumps(action_params), # message_ts는 이 함수에서 알 수 없으므로 제외
+                            "action_id": f"execute_{action_params.get('action_type', 'unknown')}"
+                        }
+                    ]
+                })
+
+            # Check attachment status for single volume summary (Directly use 'attachments')
+            is_attached = len(analysis_result.get('attachments', [])) > 0
+            is_idle = analysis_result.get('is_idle', False)
+
+            # Add action button conditionally based on is_idle and is_attached
+            if is_idle:
+                 action_elements = []
+                 # Add snapshot only button
+                 action_elements.append({
+                     "type": "button",
+                     "text": {"type": "plain_text", "text": "스냅샷만 생성", "emoji": True},
+                     "value": json.dumps({
+                         "volume_id": analysis_result.get('volume_id'),
+                         "region": analysis_result.get('region'),
+                         "action_type": "snapshot_only"
+                     }),
+                     "action_id": "execute_snapshot_only"
+                 })
+                 # Add snapshot and delete button only if not attached
+                 if not is_attached:
+                     action_elements.append({
+                         "type": "button",
+                         "text": {"type": "plain_text", "text": "스냅샷 생성 후 삭제", "emoji": True},
+                         "style": "danger",
+                         "value": json.dumps({
+                             "volume_id": analysis_result.get('volume_id'),
+                             "region": analysis_result.get('region'),
+                             "action_type": "snapshot_and_delete"
+                         }),
+                         "action_id": "execute_snapshot_and_delete"
+                     })
+                 else:
+                     logger.info(f"[Summary] 볼륨 {analysis_result.get('volume_id')}은(는) 유휴 상태지만 연결되어 있어 삭제 버튼을 제외합니다.")
+                 
+                 if action_elements:
+                      blocks.append({"type": "actions", "elements": action_elements})
+            elif analysis_result.get('is_overprovisioned'):
+                 # Add resize button if overprovisioned
+                 blocks.append({
+                      "type": "actions",
+                      "elements": [
+                           {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "볼륨 크기 조정", "emoji": True},
+                                "value": json.dumps({
+                                     "volume_id": analysis_result.get('volume_id'),
+                                     "region": analysis_result.get('region'),
+                                     "action_type": "resize"
+                                }),
+                                "action_id": "execute_resize"
+                           }
+                      ]
+                 })
+
+        elif summary:
+            # 전체 리전 결과 요약 (기존 send_to_slack 로직과 유사하게)
+            idle_volumes = summary.get("total_idle_volumes", 0)
+            over_volumes = summary.get("total_overprovisioned_volumes", 0)
+            savings = summary.get("total_estimated_savings", 0)
+            actions = summary.get("suggested_actions", [])
+
+            blocks.append({
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*총 유휴 볼륨:* {idle_volumes}개"},
+                    {"type": "mrkdwn", "text": f"*총 과대 프로비저닝 볼륨:* {over_volumes}개"},
+                    {"type": "mrkdwn", "text": f"*총 예상 월간 절감액:* ${savings:.2f}"}
+                ]
+            })
+            summary_text = f"EBS 분석 요약: 유휴 {idle_volumes}, 과대 {over_volumes}, 절감 ${savings:.2f}/월"
+
+            if actions:
+                blocks.append({"type": "divider"})
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*상위 권장 조치 (최대 5개)*"}
+                })
+                action_buttons_added = 0
+                for i, action in enumerate(actions[:5]):
+                     if action_buttons_added >= 5: break # Limit buttons
+
+                     action_params = action.get('action_params', {})
+                     action_type = action_params.get('action_type')
+                     volume_id = action.get('volume_id')
+                     region = action.get('region')
+                     recommendation = action.get('recommendation', '')
+                     estimated_savings = action.get('estimated_savings', 0)
+                     
+                     # IMPORTANT: For summary view, we might not have detailed attachment info per volume readily available in 'action'.
+                     # We need to ensure 'is_attached' is correctly passed or inferred.
+                     # Assuming 'is_attached' is now part of the 'action' dict if available (needs confirmation from analyze_all_regions)
+                     is_attached = action.get('is_attached', False) # Relying on this key being present in the 'action' item
+                     is_idle_action = "snapshot" in action_type # Check if it's an idle-related action
+                     is_resize_action = action_type == 'resize'
+
+                     show_delete_button = is_idle_action and not is_attached
+                     show_snapshot_only_button = is_idle_action and is_attached
+                     show_resize_button = is_resize_action
+
+                     button_element = None
+                     button_style = "primary"
+
+                     if show_delete_button:
+                          button_text = "스냅샷 생성 후 삭제"
+                          button_style = "danger"
+                          button_action_id = "execute_snapshot_and_delete"
+                          # Ensure action_params reflect the correct action
+                          final_action_params = action_params.copy()
+                          final_action_params['action_type'] = "snapshot_and_delete"
+                     elif show_snapshot_only_button:
+                          button_text = "스냅샷만 생성"
+                          button_style = "primary"
+                          button_action_id = "execute_snapshot_only"
+                          final_action_params = action_params.copy()
+                          final_action_params['action_type'] = "snapshot_only"
+                     elif show_resize_button:
+                          button_text = "볼륨 크기 조정"
+                          button_style = "primary"
+                          button_action_id = "execute_resize"
+                          final_action_params = action_params.copy()
+                          final_action_params['action_type'] = "resize"
+                     else:
+                          # If it's idle but attached, we defaulted to snapshot_only above.
+                          # If it's idle and not attached, we defaulted to delete.
+                          # If neither, maybe don't show a button or show a generic one?
+                          # Let's skip if no clear action derived from the conditions.
+                          logger.debug(f"Skipping button for action: {action} as conditions didn't match specific buttons.")
+                          continue
+
+                     button_element = {
+                         "type": "button",
+                         "text": {"type": "plain_text", "text": button_text, "emoji": True},
+                         "style": button_style,
+                         "value": json.dumps(final_action_params), # Use the modified params
+                         "action_id": button_action_id
+                     }
+
+                     blocks.append({
+                         "type": "section",
+                         "text": {
+                             "type": "mrkdwn",
+                             "text": f"*{action_buttons_added+1}.* 볼륨 `{volume_id}` ({region})\n"
+                                     f"• 추천: {recommendation}\n"
+                                     f"• 예상 절감액: ${estimated_savings:.2f}/월"
+                         },
+                         "accessory": button_element
+                     })
+                     action_buttons_added += 1
+
+                if len(actions) > action_buttons_added:
+                     blocks.append({
+                         "type": "context",
+                         "elements": [{"type": "mrkdwn", "text": f"*... 외 {len(actions) - action_buttons_added}개의 조치가 더 있습니다.*"}]
+                     })
+        else:
+             # 요약 정보가 없는 경우 (오류 또는 빈 결과)
+             error_msg = analysis_result.get('error', '분석 결과 요약 정보를 찾을 수 없습니다.')
+             blocks.append({
+                 "type": "section",
+                 "text": {"type": "mrkdwn", "text": f"*오류 또는 결과 없음:* {error_msg}"}
+             })
+             summary_text = f"EBS 분석 요약 생성 실패: {error_msg}"
+
+        # 메시지 전송
+        if channel_id and bot_token:
+            # chat.postMessage 사용 (스레드 지원 안 함)
+            response = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={
+                    "Authorization": f"Bearer {bot_token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "channel": channel_id,
+                    "blocks": blocks,
+                    "text": summary_text
+                }
+            )
+            if response.status_code != 200 or not response.json().get('ok', False):
+                logger.error(f"Slack API (chat.postMessage)로 요약 전송 실패: {response.status_code} {response.text}")
+                return {"success": False, "status_code": response.status_code, "response": response.text}
+            logger.info(f"채널 {channel_id}로 분석 요약 전송 성공.")
+            return {"success": True, "response": response.json()}
+        elif target_webhook_url:
+            # 웹훅 사용
+            payload = {"blocks": blocks, "text": summary_text}
+            response = requests.post(
+                target_webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code != 200:
+                logger.error(f"Slack 웹훅으로 요약 전송 실패: {response.status_code} {response.text}")
+                return {"success": False, "status_code": response.status_code, "response": response.text}
+            logger.info("웹훅으로 분석 요약 전송 성공.")
+            return {"success": True}
+        else:
+            # 이 경우는 맨 위에서 처리되었어야 함
+            return {"success": False, "error": "No valid target for Slack message"}
+
+    except Exception as e:
+        logger.error(f"Slack 분석 요약 전송 중 예외 발생: {str(e)}", exc_info=True)
+        return {"success": False, "error": str(e)}

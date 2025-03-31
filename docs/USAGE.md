@@ -2,15 +2,23 @@
 
 ## 개요
 
-이 문서는 통합된 Lambda 함수를 사용하여 AWS EBS 볼륨을 분석하고 최적화하는 방법을 설명합니다. 이 통합 Lambda 함수(`consolidated_lambda.py`)는 이벤트 유형에 따라 볼륨 분석, Slack 요청 처리, 그리고 권장 조치 실행의 세 가지 주요 기능을 수행합니다.
+이 문서는 통합된 Lambda 함수를 사용하여 AWS EBS 볼륨을 분석하고 최적화하는 방법을 설명합니다. 이 통합 Lambda 함수(`lambdas/consolidated_lambda.py`)는 이벤트 유형에 따라 볼륨 분석, Slack 요청 처리, 그리고 SQS를 통한 권장 조치 실행의 세 가지 주요 기능을 조정합니다.
 
 ## 통합 Lambda 함수 아키텍처
 
-통합 Lambda 함수는 이벤트 유형에 따라 다음 세 가지 주요 기능을 처리합니다:
+통합 Lambda 함수는 이벤트 소스를 감지하고, 다음 핸들러 모듈로 작업을 위임합니다:
 
-1. **분석 요청 처리**: EBS 볼륨 사용 패턴 분석 및 권장 조치 생성
-2. **Slack 요청 처리**: Slack에서의 슬래시 명령어 및 상호작용 처리
-3. **액션 실행 처리**: 권장 조치의 실제 실행 (스냅샷 생성, 볼륨 삭제 등)
+1. **분석 요청 처리** (`lambdas/consolidated_lambda.py`의 `handle_analyze_request`):
+   - EBS 볼륨 사용 패턴 분석 및 권장 조치 생성 (주요 로직은 `ebs/ebs_service.py`에 위임)
+   - 분석 결과를 S3에 저장
+   - Slack으로 요약 알림 전송 (`integrations/slack/slack_messenger.py` 사용)
+2. **Slack 요청 처리** (`lambdas/handlers/slack_handler.py`):
+   - Slack에서의 슬래시 명령어 및 상호작용 처리
+   - 빠른 초기 응답 후, 실제 처리를 위해 Lambda 자체를 비동기 호출하거나 SQS 큐에 작업 추가
+3. **SQS 메시지 처리** (`lambdas/handlers/sqs_handler.py`):
+   - SQS 큐에서 받은 메시지(주로 액션 실행 요청) 처리
+   - 요청된 액션 실행 (스냅샷 생성, 볼륨 삭제 등, `ebs/actions/ebs_actions.py` 사용)
+   - 실행 결과를 Slack으로 알림 (`integrations/slack/slack_messenger.py` 사용)
 
 ## 설정 방법
 
@@ -18,7 +26,7 @@
 
 1. **Lambda 함수 배포**:
 
-   - 소스 코드: `lambdas/consolidated_lambda.py`
+   - 소스 코드: 프로젝트 전체 (의존성 포함하여 배포 패키지 생성)
    - 핸들러: `lambdas.consolidated_lambda.lambda_handler`
    - 런타임: Python 3.8 이상
    - 메모리: 최소 256MB (권장 512MB)
@@ -229,8 +237,8 @@ Slack API Gateway 요청은 통합 Lambda가 자동으로 처리하므로 수동
 
 1. **유휴 볼륨 액션**:
 
-   - `snapshot_and_delete`: 스냅샷 생성 후 볼륨 삭제
-   - `snapshot_only`: 스냅샷만 생성
+   - `snapshot_and_delete`: 스냅샷 생성 후 볼륨 삭제 (_EC2 인스턴스에 연결되지 않은 유휴 볼륨에만 해당_)
+   - `snapshot_only`: 스냅샷만 생성 (_모든 유휴 볼륨에 해당, 특히 EC2 인스턴스에 연결된 유휴 볼륨의 기본 옵션_)
    - `change_type`: 볼륨 타입 변경 (io1/io2 → gp3)
 
 2. **과대 프로비저닝 볼륨 액션**:
