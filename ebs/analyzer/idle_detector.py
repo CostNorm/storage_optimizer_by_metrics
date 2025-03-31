@@ -88,6 +88,30 @@ class IdleVolumeDetector:
                 reasons.append(f"볼륨이 'available' 상태로 어떤 인스턴스에도 연결되어 있지 않음")
                 metrics_summary['volume_state'] = {'state': 'available'}
                 return True, "볼륨이 어떤 인스턴스에도 연결되어 있지 않습니다.", metrics_summary
+            
+            # 볼륨이 'in-use' 상태인지 확인
+            if volume_state == 'in-use':
+                metrics_summary['volume_state'] = {'state': 'in-use'}
+                
+                # 볼륨이 in-use 상태인데 메트릭이 없는 경우 특별 처리
+                if not metrics or len(metrics) == 0:
+                    # 연결 시간 확인 (최근에 연결된 볼륨은 메트릭이 없을 수 있음)
+                    attachments = volume_response['Volumes'][0].get('Attachments', [])
+                    if attachments:
+                        # 가장 최근 연결 시간 확인
+                        from datetime import datetime, timezone
+                        now = datetime.now(timezone.utc)
+                        
+                        for attachment in attachments:
+                            attach_time = attachment.get('AttachTime')
+                            if attach_time:
+                                # 연결된지 24시간 이내면 유휴 상태가 아닌 것으로 판단
+                                hours_since_attach = (now - attach_time).total_seconds() / 3600
+                                if hours_since_attach < 24:
+                                    return False, f"볼륨이 최근({hours_since_attach:.1f}시간 전)에 연결되어 데이터가 충분하지 않습니다.", metrics_summary
+                    
+                    # 메트릭이 없는 in-use 볼륨은 유휴 상태로 간주하지 않음
+                    return False, "볼륨이 'in-use' 상태이지만 CloudWatch 메트릭이 없습니다. 메트릭 수집에 문제가 있을 수 있으니 추가 조사가 필요합니다.", metrics_summary
         except Exception as e:
             logger.warning(f"볼륨 {volume_id}의 상태 확인 중 오류 발생: {str(e)}")
         
