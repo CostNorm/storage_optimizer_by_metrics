@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from ..utils.utils import calculate_monthly_cost
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 
@@ -743,22 +744,104 @@ class OverprovisionedVolumeDetector:
         growth_buffer = min(max(theoretical_size * 0.1, 1), theoretical_size * 0.3)
         
         # 권장 크기 = 이론적 필요 크기 + 성장 버퍼, 최소 4GB
-        recommended_size = max(4, int(theoretical_size + growth_buffer + 0.5))  # 0.5 추가하여 반올림
-        
-        # Amazon EBS 볼륨은 일반적으로 1GB 단위로 제공되므로 위로 반올림
-        if recommended_size < current_size:
-            # 최소 20% 절약이 되어야 의미 있음
-            if recommended_size <= current_size * 0.8:
+        recommended_size_float = theoretical_size + growth_buffer
+        recommended_size = max(4, int(recommended_size_float + 0.99))  # 올림 효과 + 최소값
+
+        logger.info(f"권장 크기 계산: 현재={current_size}GB, 최대사용률={usage_percent:.1f}%, 이론크기={theoretical_size:.1f}GB, 버퍼={growth_buffer:.1f}GB -> 권장={recommended_size}GB")
+
+        # 권장 크기가 현재 크기보다 크거나 같으면 현재 크기 유지
+        if recommended_size >= current_size:
+            logger.info(f"권장 크기({recommended_size}GB)가 현재 크기({current_size}GB)보다 크거나 같아 현재 크기 유지 권장.")
+            return current_size
+        else:
+            # 최소 절감 비율 확인 (예: 10% 이상 절감될 때만)
+            min_saving_percent = self.criteria.get('min_saving_percent_for_resize', 10)
+            if recommended_size <= current_size * (1 - min_saving_percent / 100.0):
                 return recommended_size
             else:
+                logger.info(f"권장 크기({recommended_size}GB) 절감 효과({min_saving_percent}% 미만)가 미미하여 현재 크기({current_size}GB) 유지 권장.")
                 return current_size
-        else:
-            # 계산된 권장 크기가 현재 크기보다 크면 현재 크기 유지
-            return current_size
-    
+
+    def get_performance_metrics(self, volume_id, start_time, end_time):
+        """
+        CloudWatch에서 볼륨의 최대 성능 메트릭(IOPS, 처리량)을 가져옵니다.
+        
+        :param volume_id: EBS 볼륨 ID
+        :param start_time: 측정 시작 시간
+        :param end_time: 측정 종료 시간
+        :return: 메트릭 데이터 딕셔너리 (최대값 포함)
+        """
+        metrics_to_check = {
+            'VolumeReadOps': 'Count',
+            'VolumeWriteOps': 'Count',
+            'VolumeReadBytes': 'Bytes',
+            'VolumeWriteBytes': 'Bytes'
+        }
+        performance_data = {}
+        period = int((end_time - start_time).total_seconds())
+        # CloudWatch GetMetricStatistics는 최대 1440개의 데이터 포인트를 반환합니다.
+        # 기간이 너무 길면 Period를 조정해야 할 수 있습니다. (여기서는 전체 기간으로 설정)
+        # 더 긴 기간의 경우, 여러 번 호출하거나 GetMetricData 사용 고려.
+        # 여기서는 GetMetricStatistics를 사용하고, 데이터가 없는 경우를 처리합니다.
+        if period > 14 * 86400: # 2주 이상이면 Period 조정 (예: 일 단위)
+            period = 86400
+        elif period == 0: # 시작/종료 같으면 기본값
+             period = 300 # 5분
+
+        for metric_name, unit in metrics_to_check.items():
+            try:
+                response = self.cloudwatch_client.get_metric_statistics(
+                    Namespace='AWS/EBS',
+                    MetricName=metric_name,
+                    Dimensions=[{'Name': 'VolumeId', 'Value': volume_id}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=period,
+                    Statistics=['Maximum'], # 최대값 사용
+                    Unit=unit
+                )
+                # 데이터 포인트가 있는 경우 최대값 찾기
+                if response['Datapoints']:
+                    max_value = max(dp['Maximum'] for dp in response['Datapoints'])
+                    performance_data[f'max_{metric_name}'] = max_value
+                else:
+                    performance_data[f'max_{metric_name}'] = 0 # 데이터 없으면 0
+            except ClientError as e:
+                # 권한 부족 등의 오류 처리
+                if e.response['Error']['Code'] == 'AccessDenied':
+                    logger.warning(f"CloudWatch 메트릭 접근 권한 부족: {metric_name} for {volume_id}")
+                else:
+                    logger.error(f"CloudWatch {metric_name} 메트릭 조회 오류 for {volume_id}: {e}", exc_info=True)
+                performance_data[f'max_{metric_name}'] = None
+            except Exception as e:
+                logger.error(f"CloudWatch {metric_name} 메트릭 처리 중 예외 for {volume_id}: {e}", exc_info=True)
+                performance_data[f'max_{metric_name}'] = None
+
+        # 초당 최대 IOPS 계산 (Ops는 Period 동안의 합계 또는 최대값이므로 주의 필요)
+        # GetMetricStatistics의 Maximum은 해당 Period 내의 '최대 발생률'을 의미할 수 있음 (문서 확인 필요)
+        # 여기서는 Period 동안 발생한 최대 Operation 수를 기준으로 함 (더 정확하려면 짧은 Period 사용 필요)
+        # 편의상 Read+Write Ops의 최대값을 합산하여 사용 (동시 발생 아닐 수 있음)
+        max_total_ops = (performance_data.get('max_VolumeReadOps', 0) or 0) + (performance_data.get('max_VolumeWriteOps', 0) or 0)
+         # 실제 필요한 IOPS는 Period로 나눠야 하지만, GetMetricStatistics Maximum 의미 해석 필요
+         # 여기서는 일단 최대 발생 건수를 'max_total_ops_in_period'로 저장
+        performance_data['max_total_ops_in_period'] = max_total_ops
+
+        # 초당 최대 처리량 계산 (Bytes/period)
+        max_read_throughput_bps = (performance_data.get('max_VolumeReadBytes', 0) or 0)
+        max_write_throughput_bps = (performance_data.get('max_VolumeWriteBytes', 0) or 0)
+        # 이것도 Period 동안의 최대 Byte 수. 실제 Throughput(Bytes/sec) 계산 필요
+        # performance_data['max_read_throughput_bytes_per_sec'] = max_read_throughput_bps / period if period > 0 else 0
+        # performance_data['max_write_throughput_bytes_per_sec'] = max_write_throughput_bps / period if period > 0 else 0
+        # 여기서는 일단 최대 Byte 수를 저장
+        performance_data['max_total_bytes_in_period'] = max_read_throughput_bps + max_write_throughput_bps
+
+
+        logger.info(f"볼륨 {volume_id} 성능 메트릭 (최대값): {performance_data}")
+        return performance_data
+
     def is_overprovisioned_volume(self, volume_id, volume):
         """
-        특정 볼륨이 과대 프로비저닝되었는지 확인
+        특정 볼륨이 과대 프로비저닝되었는지 확인 (디스크 사용률 및 성능 고려)
         
         :param volume_id: 볼륨 ID
         :param volume: 볼륨 정보 딕셔너리
@@ -779,62 +862,162 @@ class OverprovisionedVolumeDetector:
             # 연결된 인스턴스 정보
             instance_id = volume['Attachments'][0]['InstanceId']
             device_name = volume['Attachments'][0]['Device']
-            
-            logger.info(f"볼륨 {volume_id} (크기: {volume.get('Size')}GB)가 인스턴스 {instance_id}에 {device_name}로 연결됨")
-            
-            # 디스크 사용률 데이터 수집
+            current_type = volume.get('VolumeType', '')
+            provisioned_iops = volume.get('Iops') # io1, io2, gp3
+            provisioned_throughput = volume.get('Throughput') # gp3
+
+            logger.info(f"볼륨 {volume_id} (타입: {current_type}, 크기: {volume.get('Size')}GB, IOPS: {provisioned_iops}, Throughput: {provisioned_throughput}) 분석 시작")
+
             end_time = datetime.now()
-            start_time = end_time - timedelta(days=30 * self.criteria['months_to_check'])
+            start_time = end_time - timedelta(days=max(1, 30 * self.criteria.get('months_to_check', 1))) # 최소 1일
+
+            # 1. 디스크 사용률 분석
             usage_datapoints = self.get_disk_usage_metrics(instance_id, device_name, start_time, end_time)
-            
-            # 데이터가 없는 경우 추정치 사용
-            if not usage_datapoints or len(usage_datapoints) == 0:
-                logger.warning(f"볼륨 {volume_id}의 디스크 사용률 데이터를 수집할 수 없습니다. 추정치를 사용합니다.")
+            if not usage_datapoints:
+                logger.warning(f"볼륨 {volume_id}: 디스크 사용률 데이터 없음, 추정치 사용.")
                 usage_datapoints = self.get_estimated_disk_usage(instance_id, device_name)
-                logger.info(f"볼륨 {volume_id}에 대한 추정 사용률 데이터: {usage_datapoints}")
+            
+            is_size_over, size_reason, usage_summary = self.is_overprovisioned(usage_datapoints)
+            recommended_size = self.recommend_volume_size(usage_summary, volume.get('Size', 0))
+
+            # 2. 성능 메트릭 분석 (IOPS, Throughput) - 최대값 기준
+            performance_data = self.get_performance_metrics(volume_id, start_time, end_time)
+            
+            # 성능 과대 프로비저닝 판단 로직 (간단 예시)
+            is_perf_over = False
+            perf_reason = "성능은 적절히 사용 중"
+            recommended_iops = None
+            recommended_throughput = None
+
+            # 성능 임계값 (설정 파일에서 가져와야 함)
+            max_iops_usage_threshold_percent = self.criteria.get('max_iops_usage_threshold_percent', 50) # 예: 50%
+            max_throughput_usage_threshold_percent = self.criteria.get('max_throughput_usage_threshold_percent', 50) # 예: 50%
+            buffer_percent = self.criteria.get('buffer_percent', 20)
+
+            # 최대 관측 IOPS (해석 주의)
+            # GetMetricStatistics Maximum / Period 로 초당 최대 IOPS 추정 필요
+            # 여기서는 'max_total_ops_in_period'를 사용 (단순 참고용)
+            max_observed_ops = performance_data.get('max_total_ops_in_period') 
+            max_observed_bytes = performance_data.get('max_total_bytes_in_period')
+            
+            # --- 성능 과대 프로비저닝 판단 (io1/io2/gp3 대상) ---
+            if current_type in ['io1', 'io2'] and provisioned_iops and max_observed_ops is not None:
+                # io1/io2는 IOPS 기준 판단 (Throughput은 IOPS에 따라 결정됨)
+                # !!! 중요: max_observed_ops의 정확한 해석 및 기간 고려 필요 !!!
+                # !!! 아래 로직은 예시이며, 실제로는 기간 내 평균 최대 IOPS 등으로 계산해야 할 수 있음 !!!
+                estimated_peak_iops = max_observed_ops # 가정: Period 내 최대 발생 건수가 Peak IOPS와 유사
+                if estimated_peak_iops < provisioned_iops * (max_iops_usage_threshold_percent / 100.0):
+                    is_perf_over = True
+                    perf_reason = f"프로비저닝된 IOPS({provisioned_iops}) 대비 최대 관측 IOPS({estimated_peak_iops})가 낮음 ({max_iops_usage_threshold_percent}% 미만 사용)"
+                    # 권장 IOPS 계산
+                    recommended_iops = int(estimated_peak_iops * (1 + buffer_percent / 100.0))
+                    # io1/io2 최소 IOPS 적용
+                    recommended_iops = max(100, recommended_iops) 
+                    logger.info(f"{volume_id}: IOPS 과대 프로비저닝 감지. 권장 IOPS: {recommended_iops}")
+
+            elif current_type == 'gp3' and provisioned_iops and provisioned_throughput and max_observed_ops is not None and max_observed_bytes is not None:
+                 # gp3는 IOPS와 Throughput 모두 고려
+                 # !!! 위와 동일한 IOPS/Throughput 해석 주의 !!!
+                 estimated_peak_iops = max_observed_ops # 가정
+                 # Throughput 계산 (Bytes / Period) -> MB/s
+                 period_seconds = max(1, int((end_time - start_time).total_seconds())) # 0 방지
+                 estimated_peak_throughput_mbps = (max_observed_bytes / period_seconds) / (1024 * 1024) if period_seconds > 0 else 0
+
+                 iops_over = estimated_peak_iops < provisioned_iops * (max_iops_usage_threshold_percent / 100.0)
+                 throughput_over = estimated_peak_throughput_mbps < provisioned_throughput * (max_throughput_usage_threshold_percent / 100.0)
+
+                 if iops_over or throughput_over:
+                      is_perf_over = True
+                      perf_reason_parts = []
+                      # 권장 IOPS 계산
+                      recommended_iops = int(estimated_peak_iops * (1 + buffer_percent / 100.0))
+                      recommended_iops = max(3000, recommended_iops) # gp3 최소 IOPS
+                      recommended_iops = min(16000, recommended_iops) # gp3 최대 IOPS
+                      if iops_over:
+                           perf_reason_parts.append(f"IOPS({provisioned_iops} 대비 최대 {estimated_peak_iops}) 낮음")
+                      
+                      # 권장 Throughput 계산
+                      recommended_throughput = int(estimated_peak_throughput_mbps * (1 + buffer_percent / 100.0))
+                      recommended_throughput = max(125, recommended_throughput) # gp3 최소 Throughput
+                      recommended_throughput = min(1000, recommended_throughput) # gp3 최대 Throughput
+                      if throughput_over:
+                           perf_reason_parts.append(f"Throughput({provisioned_throughput}MB/s 대비 최대 {estimated_peak_throughput_mbps:.1f}MB/s) 낮음")
+                      
+                      perf_reason = "성능 과대 프로비저닝: " + ", ".join(perf_reason_parts)
+                      logger.info(f"{volume_id}: 성능 과대 프로비저닝 감지. 권장 IOPS: {recommended_iops}, 권장 Throughput: {recommended_throughput}")
+
+            # 최종 판단: 크기 또는 성능 중 하나라도 과대 프로비저닝이면 True
+            is_overall_over = is_size_over or is_perf_over
+            
+            # 최종 이유 조합
+            final_reason = ""
+            if is_size_over: final_reason += size_reason
+            if is_perf_over: final_reason += ("; " if final_reason else "") + perf_reason
+            if not is_overall_over: final_reason = "크기와 성능 모두 적절히 사용 중"
+
+            # 결과 데이터 구성
+            additional_data = {
+                'volume_type': current_type,
+                'size': volume.get('Size', 0),
+                'provisioned_iops': provisioned_iops,
+                'provisioned_throughput': provisioned_throughput,
+                'disk_usage_data': usage_summary,
+                'performance_data': performance_data, # 수집된 성능 메트릭 추가
+                'recommended_size': recommended_size if is_size_over else volume.get('Size', 0), # 사이즈 줄일 때만 권장값 반영
+                'recommended_iops': recommended_iops if is_perf_over else provisioned_iops,
+                'recommended_throughput': recommended_throughput if is_perf_over else provisioned_throughput,
+                'recommendation': "최적화 권장", # 기본 메시지
+                'estimated_savings': 0 # 절감액 계산 로직 필요
+            }
+
+            # 권장 메시지 및 절감액 계산
+            if is_overall_over:
+                recommendation_parts = []
+                # io1/io2 -> gp3 전환 우선 고려
+                if current_type in ['io1', 'io2'] and is_overall_over:
+                    # 항상 gp3로 변경 권장 (비용 효율적)
+                     target_type = 'gp3'
+                     target_size = recommended_size if is_size_over else volume.get('Size', 0)
+                     target_iops = recommended_iops if recommended_iops else 3000 # 권장값 없으면 기본값
+                     target_throughput = recommended_throughput if recommended_throughput else 125 # 권장값 없으면 기본값
+                     
+                     # gp3 비용 계산 (개선된 calculate_monthly_cost 필요 - iops/throughput 비용 포함)
+                     # new_cost = calculate_monthly_cost(target_size, target_type, self.region, iops=target_iops, throughput=target_throughput)
+                     # current_cost = calculate_monthly_cost(current_size, current_type, self.region, iops=provisioned_iops)
+                     # savings = current_cost - new_cost
+                     # additional_data['estimated_savings'] = savings
+                     
+                     recommendation_parts.append(f"gp3 타입 변경(크기:{target_size}GB, IOPS:{target_iops}, TP:{target_throughput}MB/s)")
+                     additional_data['recommended_type'] = target_type # 추천 타입 명시
+
+                else: # gp2, gp3, st1, sc1 등
+                     target_type = current_type
+                     target_size = recommended_size if is_size_over else volume.get('Size', 0)
+                     target_iops = provisioned_iops # 기본값
+                     target_throughput = provisioned_throughput # 기본값
+                     
+                     if is_size_over and target_size < volume.get('Size', 0):
+                          recommendation_parts.append(f"크기 축소 ({target_size}GB)")
+                     
+                     if current_type == 'gp3' and is_perf_over:
+                          target_iops = recommended_iops if recommended_iops else provisioned_iops
+                          target_throughput = recommended_throughput if recommended_throughput else provisioned_throughput
+                          if target_iops != provisioned_iops or target_throughput != provisioned_throughput:
+                               recommendation_parts.append(f"gp3 성능 조정 (IOPS:{target_iops}, TP:{target_throughput}MB/s)")
+                     
+                     # 비용 계산 (개선된 calculate_monthly_cost 필요)
+                     # new_cost = calculate_monthly_cost(target_size, target_type, self.region, iops=target_iops, throughput=target_throughput) # gp3만 iops/tp 전달
+                     # current_cost = calculate_monthly_cost(current_size, current_type, self.region, iops=provisioned_iops, throughput=provisioned_throughput)
+                     # savings = current_cost - new_cost
+                     # additional_data['estimated_savings'] = savings
+
+                additional_data['recommendation'] = "과대 프로비저닝: " + ", ".join(recommendation_parts) + " 고려"
             else:
-                logger.info(f"볼륨 {volume_id}에 대한 수집된 사용률 데이터: {usage_datapoints}")
-            
-            # 과대 프로비저닝 여부 판단
-            is_over, reason, usage_summary = self.is_overprovisioned(usage_datapoints)
-            
-            # 과대 프로비저닝 여부, 이유, 그리고 추가 정보 반환
-            additional_data = {}
-            if is_over:
-                # 현재 볼륨 정보
-                additional_data['volume_type'] = volume['VolumeType']
-                additional_data['size'] = volume['Size']
-                
-                # 권장 크기 계산
-                recommended_size = self.recommend_volume_size(usage_summary, volume['Size'])
-                additional_data['recommended_size'] = recommended_size
-                
-                # 예상 절감액 계산
-                current_cost = calculate_monthly_cost(volume['Size'], volume['VolumeType'], self.region)
-                
-                # io1/io2 볼륨이면 gp3로 변환 추천
-                if volume['VolumeType'] in ['io1', 'io2']:
-                    gp3_cost = calculate_monthly_cost(volume['Size'], 'gp3', self.region)
-                    savings = current_cost - gp3_cost
-                    additional_data['recommended_type'] = 'gp3'
-                    additional_data['estimated_savings'] = savings
-                    additional_data['recommendation'] = '과대 프로비저닝 상태입니다. gp3 볼륨 유형으로 전환 고려'
-                else:
-                    # 크기 축소 추천
-                    reduced_cost = calculate_monthly_cost(recommended_size, volume['VolumeType'], self.region)
-                    savings = current_cost - reduced_cost
-                    additional_data['estimated_savings'] = savings
-                    additional_data['recommendation'] = f'과대 프로비저닝 상태입니다. 볼륨 크기를 {recommended_size}GB로 축소 고려'
-                
-                # 디스크 사용률 데이터 추가
-                additional_data['disk_usage_data'] = usage_summary
-            else:
-                # 상세 진단 정보 추가
-                additional_data['disk_usage_data'] = usage_summary
-                logger.info(f"볼륨 {volume_id}는 과대 프로비저닝 상태가 아닙니다: {reason}")
-            
-            return is_over, reason, additional_data
-            
+                 additional_data['recommendation'] = "현재 설정 유지 권장"
+
+
+            return is_overall_over, final_reason, additional_data
+
         except Exception as e:
             logger.error(f"볼륨 {volume_id} 과대 프로비저닝 확인 중 오류 발생: {str(e)}", exc_info=True)
             return False, f"분석 오류: {str(e)}", None

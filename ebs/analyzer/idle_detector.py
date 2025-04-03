@@ -213,9 +213,9 @@ class IdleVolumeDetector:
                     
                     # 권장 조치 추가
                     if volume['VolumeType'] in ['io1', 'io2']:
-                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 gp3로 변경 고려'
+                        volume_info['recommendation'] = 'Idle volume detected. Consider creating a snapshot and deleting the volume or changing type to gp3.'
                     else:
-                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 필요 최소 크기로 축소 고려'
+                        volume_info['recommendation'] = 'Idle volume detected. Consider creating a snapshot and deleting the volume or resizing to the minimum required size.'
                     
                     idle_volumes.append(volume_info)
                     continue  # 다음 볼륨으로 넘어감
@@ -252,9 +252,9 @@ class IdleVolumeDetector:
                     
                     # 권장 조치 추가 - 유휴 볼륨에 맞는 적절한 추천으로 변경
                     if volume['VolumeType'] in ['io1', 'io2']:
-                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 gp3로 변경 고려'
+                        volume_info['recommendation'] = 'Idle volume detected. Consider creating a snapshot and deleting the volume or changing type to gp3.'
                     else:
-                        volume_info['recommendation'] = '유휴 상태입니다. 스냅샷 생성 후 볼륨 삭제 또는 필요 최소 크기로 축소 고려'
+                        volume_info['recommendation'] = 'Idle volume detected. Consider creating a snapshot and deleting the volume or resizing to the minimum required size.'
                     
                     idle_volumes.append(volume_info)
                     logger.info(f"{volume_id} 볼륨이 유휴 상태로 감지되었습니다: {reason}")

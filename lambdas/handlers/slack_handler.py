@@ -17,7 +17,7 @@ try:
 
     from dotenv import load_dotenv
     from utils.sqs_helper import enqueue_action
-    from integrations.slack.slack_messenger import send_original_command # Assuming this exists or will be created
+    from integrations.slack.slack_messenger import send_original_command, send_slack_message # Assuming this exists or will be created
 
     # Load environment variables
     load_dotenv(dotenv_path=root_dir / '.env') # Specify path to .env if needed
@@ -170,27 +170,44 @@ def process_slack_request_async(event, context):
         action_data["timestamp"] = int(time.time())
         action_data["raw_event"] = event # SQS 메시지에서 재시도 확인 등을 위해 원본 이벤트 포함
 
-        # 슬래시 커맨드인 경우, 원본 명령어 표시 및 스레드 생성
+        # 슬래시 커맨드인 경우, 초기 메시지 전송 및 ts 저장
+        initial_message_ts = None # Initialize ts
         if action_data.get("interaction_type") == "slash_command":
             channel_id = action_data.get("channel_id")
-            command = action_data.get("command")
-            text = action_data.get("text")
             requested_by = action_data.get("requested_by")
 
-            if channel_id and SLACK_BOT_TOKEN and send_original_command:
-                success, thread_ts = send_original_command(
-                    channel_id, command, text, SLACK_BOT_TOKEN, requested_by
-                )
-                if success and thread_ts:
-                    action_data["thread_ts"] = thread_ts # 생성된 스레드 ID 저장
-                    logger.info(f"원본 명령어 메시지 전송 및 스레드 생성 완료: {thread_ts}")
-                else:
-                    logger.warning("원본 명령어 메시지 전송 또는 스레드 생성 실패.")
+            if channel_id and SLACK_BOT_TOKEN:
+                # Use send_slack_message from slack_messenger
+                # Ensure send_slack_message is imported correctly
+                try:
+                     # Import send_slack_message if not already globally imported and available
+                     if 'send_slack_message' not in globals() or send_slack_message is None:
+                         from integrations.slack.slack_messenger import send_slack_message
+                     
+                     if send_slack_message:
+                        # Send an initial message like "Analysis starting..."
+                        initial_message_text = f"<@{requested_by}> requested EBS analysis. Starting..."
+                        success, initial_message_ts = send_slack_message(
+                            channel_id,
+                            initial_message_text,
+                            SLACK_BOT_TOKEN,
+                            thread_ts=None # Post as a new message
+                        )
+                        if success and initial_message_ts:
+                             action_data["initial_message_ts"] = initial_message_ts # Store the ts
+                             logger.info(f"Initial analysis message sent. ts: {initial_message_ts}")
+                        else:
+                             logger.warning("Failed to send initial analysis message or get its timestamp.")
+                     else:
+                          logger.error("send_slack_message function is not available after import attempt.")
+                except ImportError:
+                     logger.error("Failed to import send_slack_message from integrations.slack.slack_messenger")
+                except Exception as send_err:
+                     logger.error(f"Error sending initial Slack message: {send_err}", exc_info=True)
             else:
-                 logger.warning("Slack 봇 토큰 또는 채널 ID가 없어 원본 명령어를 전송할 수 없습니다.")
+                 logger.warning("Cannot send initial message: Missing Channel ID or Bot Token.")
 
-
-        # 4. SQS에 메시지 전송
+        # 4. SQS에 메시지 전송 (이제 action_data에 initial_message_ts 포함 가능)
         if enqueue_action:
             logger.info(f"SQS에 전송할 액션 데이터: {action_data}")
             enqueue_result = enqueue_action(action_data)

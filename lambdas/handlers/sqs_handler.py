@@ -6,57 +6,54 @@ import sys
 from pathlib import Path
 # import textwrap # Removed textwrap import
 
-# Add project root to Python path
+# Logging setup should be done early
+logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+# Removed sys.path modification logic - rely on Lambda's default path
+# root_dir = Path(__file__).resolve().parent.parent.parent
+# sys.path.append(str(root_dir))
+# print(f"Calculated root_dir: {root_dir}") # DEBUG
+# print(f"Current sys.path: {sys.path}") # DEBUG
+# print(f"Current working directory: {os.getcwd()}") # DEBUG
+
 try:
-    root_dir = Path(__file__).resolve().parent.parent.parent # Adjust path based on new location
-    sys.path.append(str(root_dir))
+    # Add debug print right before imports
+    # print(f"DEBUG sys.path before imports: {sys.path}") # Keep commented for now
 
-    from dotenv import load_dotenv
+    # Removed dotenv loading from here. Manage env vars in Lambda config.
+    # from dotenv import load_dotenv
+    # load_dotenv(dotenv_path=root_dir / '.env')
+
     # Import necessary functions from other modules
-    from ebs.ebs_service import analyze_specific_volume, analyze_all_regions, save_result_to_s3
-    # from ebs.analyzer.ebs_analyzer import EBSAnalyzer # Prefer using ebs_service
-    from ebs.actions.recommendation_executor import RecommendationExecutor # Still needed by process_execute_action
-    from integrations.slack.slack_messenger import (
+    # Using absolute imports relative to the project root package
+    from storage_optimizer_by_metrics.ebs.ebs_service import analyze_specific_volume, analyze_all_regions, save_result_to_s3
+    from storage_optimizer_by_metrics.ebs.actions.recommendation_executor import RecommendationExecutor
+    from storage_optimizer_by_metrics.integrations.slack.slack_messenger import (
         send_slack_message,
-        send_analysis_result_to_slack, # Used in process_analyze_action
-        send_all_regions_analysis_result_to_slack, # Used in process_analyze_action
-        update_analysis_result_message, # Used in process_execute_action
-        send_execution_result_to_slack # Used in process_execute_action
+        send_analysis_summary_to_slack,
+        send_execution_result_to_slack,
     )
-    # Import functions potentially needed from slack_handler
-    from lambdas.handlers.slack_handler import parse_command_parameters, check_slack_retry_header
-
-    # Load environment variables (if not already loaded by the main handler)
-    load_dotenv(dotenv_path=root_dir / '.env')
+    from storage_optimizer_by_metrics.integrations.slack.utils import check_slack_retry_header
 
 except ImportError as e:
-    logging.error(f"Failed to import modules in sqs_handler: {e}")
+    # Log the detailed import error including the problematic module
+    logger.error(f"Failed to import modules in sqs_handler: {e}", exc_info=True) # Add exc_info for traceback
     # Define fallbacks or re-raise
     analyze_specific_volume = None
     analyze_all_regions = None
     save_result_to_s3 = None
     RecommendationExecutor = None
     send_slack_message = None
-    send_analysis_result_to_slack = None
-    send_all_regions_analysis_result_to_slack = None
-    update_analysis_result_message = None
+    send_analysis_summary_to_slack = None
     send_execution_result_to_slack = None
-    parse_command_parameters = None
     check_slack_retry_header = None
-    load_dotenv = None
+    # load_dotenv = None # Removed
 
-# Logging setup
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-# handler = logging.StreamHandler() # Add if needed
-# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# handler.setFormatter(formatter)
-# logger.addHandler(handler)
-
-
-# Load necessary environment variables
-SQS_QUEUE_URL = os.environ.get('SQS_QUEUE_URL') # Needed for deleting messages
-SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN') # Needed for Slack comms
+# Load necessary environment variables (from Lambda config)
+SQS_QUEUE_URL = os.environ.get('SQS_QUEUE_URL')
+SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
+# ... load other required environment variables ...
 
 # --- Functions moved from consolidated_lambda.py ---
 
@@ -97,10 +94,11 @@ def handle_sqs_message(event, context):
             # 메시지 본문에서 액션 데이터 추출
             action_data = json.loads(record['body'])
             logger.debug(f"수신된 액션 데이터: {action_data}")
+            initial_message_ts = action_data.get('initial_message_ts') # Extract initial ts
 
             # Slack 재시도 메시지인 경우 건너뛰고 메시지 삭제
             if is_retry_request(action_data):
-                logger.info(f"Slack 재시도 요청 감지, 메시지 건너뜀: {message_id}")
+                logger.info(f"Slack 재시도 요청 감지 (raw_event 헤더 확인), 메시지 건너<0xEB><0x9B><0x81>: {message_id}")
 
                 # SQS 메시지 즉시 삭제
                 if receipt_handle and SQS_QUEUE_URL:
@@ -125,6 +123,20 @@ def handle_sqs_message(event, context):
                     "reason": "slack_retry"
                 })
                 continue # Skip to the next record
+
+            # Slack 재시도 확인
+            event = record.get('attributes', {}) # 이벤트 속성에서 헤더 가져오기 (SQS 구조에 따라 다를 수 있음)
+            headers = event.get('headers') # 실제 헤더 위치 확인 필요
+            if check_slack_retry_header(headers):
+                 logger.warning(f"메시지 {message_id}는 Slack 재시도 요청이므로 건너뜀니다.")
+                 results["skipped"] += 1
+                 results["processed"] += 1
+                 results["details"].append({
+                     "message_id": message_id,
+                     "status": "skipped",
+                     "reason": "slack_retry"
+                 })
+                 continue
 
             # action_type과 ActionType 일관성 유지
             if 'ActionType' in action_data and 'action_type' not in action_data:
@@ -190,31 +202,29 @@ def is_retry_request(action_data):
     :param action_data: SQS 메시지 본문 (파싱된 JSON 객체)
     :return: 재시도 여부 (bool)
     """
-    # raw_event 필드가 있는지, 딕셔너리인지 확인
     raw_event = action_data.get('raw_event')
     if not isinstance(raw_event, dict):
-        # logger.debug("action_data에 raw_event가 없거나 딕셔너리 타입이 아님. 재시도 아님으로 간주.")
-        return False
+        return False # No raw_event, assume not a retry
 
-    # 원본 이벤트에서 헤더 추출
     headers = raw_event.get('headers')
     if not isinstance(headers, dict):
-        # logger.debug("raw_event에 헤더 정보가 없거나 딕셔너리 타입이 아님. 재시도 아님으로 간주.")
-        return False
+        return False # No headers in raw_event
 
-    # check_slack_retry_header 함수 사용 (slack_handler에서 가져옴)
+    # Use the imported check_slack_retry_header function
     if check_slack_retry_header is None:
-        logger.error("check_slack_retry_header 함수를 사용할 수 없습니다.")
-        return False # 임포트 실패 시 안전하게 False 반환
+        logger.error("check_slack_retry_header function is not available (Import failed?). Cannot check retry status.")
+        return False # Import failed, assume not a retry for safety
 
     try:
-        is_retry, _ = check_slack_retry_header(headers)
-        if is_retry:
-             logger.info("SQS 메시지에서 Slack 재시도 감지됨 (원본 이벤트 헤더 확인)")
-        return is_retry
+        # check_slack_retry_header should ideally just return True/False
+        if check_slack_retry_header(headers):
+             logger.info("Slack retry detected via raw_event headers in SQS message.")
+             return True
+        else:
+             return False
     except Exception as e:
-        logger.error(f"재시도 헤더 확인 중 오류 발생: {e}", exc_info=True)
-        return False # 오류 시 안전하게 False 반환
+        logger.error(f"Error checking retry header in is_retry_request: {e}", exc_info=True)
+        return False # Error during check, assume not a retry
 
 
 def process_action(action_data):
@@ -231,8 +241,9 @@ def process_action(action_data):
     channel_id = action_data.get('channel_id')
     response_url = action_data.get('response_url') # 필요시 사용
     thread_ts = action_data.get('thread_ts') # 스레드 식별자
+    initial_message_ts = action_data.get('initial_message_ts') # Extract initial ts again for passing
 
-    logger.info(f"액션 처리 라우팅: type={action_type}, params={parameters}, thread_ts={thread_ts}")
+    logger.info(f"액션 처리 라우팅: type={action_type}, params={parameters}, thread_ts={thread_ts}, initial_ts={initial_message_ts}")
 
     # 슬래시 커맨드 파라미터 재파싱 로직 (필요한 경우)
     # slack_handler에서 이미 파싱되었지만, SQS 메시지에 파라미터가 없는 경우 대비
@@ -255,24 +266,24 @@ def process_action(action_data):
     # 액션 유형에 따른 분기
     # 1. 슬래시 커맨드 처리
     if action_type == 'slash_command':
-        return process_slash_command(action_data) # 파라미터는 action_data 안에 있음
+        return process_slash_command(action_data) # initial_message_ts is in action_data
 
     # 2. 직접 실행 액션 (버튼 클릭 등에서 파생)
     direct_actions = ['snapshot_and_delete', 'snapshot_only', 'resize', 'change_type']
     if action_type in direct_actions:
-        # 파라미터 유효성 검사 (volume_id, region 등)는 process_execute_action 내부에서 수행
+        # Pass initial_message_ts here if needed, though execute usually updates the message directly
         return process_execute_action(parameters, requested_by, channel_id, response_url, thread_ts)
 
     # 3. 기타 액션 타입 (예: 'analyze', 'execute' - 슬래시 커맨드 하위 명령에서 파생된 경우)
     # 이 부분은 슬래시 커맨드 처리(`process_slash_command`) 내부에서 호출되므로,
     # 직접 `process_action`으로 들어오는 경우는 흔치 않을 수 있음.
     # 하지만 명시적으로 처리 경로를 두는 것이 안전할 수 있음.
-    elif action_type == 'analyze': # 슬래시 커맨드 /ebs-optimize analyze ...
+    elif action_type == 'analyze':
         logger.warning("process_action 에서 'analyze' 직접 처리. process_slash_command 를 통해야 함.")
-        # process_analyze_action 은 슬래시 커맨드에서 호출되는 것이 일반적
-        return process_analyze_action(parameters, requested_by, channel_id, thread_ts)
+        # Pass initial_message_ts to analyze action
+        return process_analyze_action(parameters, requested_by, channel_id, thread_ts, initial_message_ts)
 
-    elif action_type == 'execute': # 슬래시 커맨드 /ebs-optimize execute ...
+    elif action_type == 'execute':
          logger.warning("process_action 에서 'execute' 직접 처리. process_slash_command 를 통해야 함.")
          # process_execute_action 은 실제 실행 타입(resize 등)으로 호출되어야 함
          # 여기서 'execute' 타입은 추가 분기가 필요함
@@ -308,9 +319,10 @@ def process_slash_command(action_data):
     requested_by = action_data.get('requested_by', 'unknown')
     channel_id = action_data.get('channel_id')
     thread_ts = action_data.get('thread_ts')
+    initial_message_ts = action_data.get('initial_message_ts') # Extract initial ts
 
     sub_command = parameters.get("sub_command")
-    logger.info(f"슬래시 커맨드 처리 시작: sub_command='{sub_command}', params={parameters}, thread_ts={thread_ts}")
+    logger.info(f"슬래시 커맨드 처리 시작: sub_command='{sub_command}', params={parameters}, thread_ts={thread_ts}, initial_ts={initial_message_ts}")
 
     if not sub_command:
         # Corrected help_text definition
@@ -328,7 +340,7 @@ def process_slash_command(action_data):
         return {"success": True, "message": "Help message displayed"}
 
     if sub_command == "analyze":
-        return process_analyze_action(parameters, requested_by, channel_id, thread_ts)
+        return process_analyze_action(parameters, requested_by, channel_id, thread_ts, initial_message_ts)
 
     elif sub_command == "execute":
         execute_action_type = parameters.get('action_type_param')
@@ -349,7 +361,7 @@ def process_slash_command(action_data):
         return {"success": False, "error": err_msg}
 
 
-def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None):
+def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None, initial_message_ts=None):
     """
     볼륨 분석 액션을 처리하고 결과를 Slack 스레드에 알립니다.
 
@@ -357,12 +369,13 @@ def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None)
     :param requested_by: 요청자 ID
     :param channel_id: Slack 채널 ID
     :param thread_ts: 응답을 보낼 스레드 타임스탬프
+    :param initial_message_ts: 초기 메시지 타임스탬프
     :return: 처리 결과 딕셔너리
     """
     if analyze_specific_volume is None or analyze_all_regions is None or save_result_to_s3 is None:
          logger.error("EBS 서비스 함수가 제대로 임포트되지 않았습니다.")
          return {"success": False, "error": "EBS service not available"}
-    if send_slack_message is None or send_analysis_result_to_slack is None or send_all_regions_analysis_result_to_slack is None:
+    if send_slack_message is None or send_analysis_summary_to_slack is None:
         logger.warning("Slack 메시징 함수 일부가 임포트되지 않았습니다.")
         # 진행은 가능하나 알림이 실패할 수 있음
 
@@ -370,22 +383,27 @@ def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None)
     region = parameters.get('region') # 특정 볼륨 분석 시 사용
     detailed_report = parameters.get('detailed_report', True) # 상세 보고서 기본 활성화
 
-    logger.info(f"볼륨 분석 액션 시작: volume_id={volume_id}, region={region}, detailed={detailed_report}, thread={thread_ts}")
+    logger.info(f"볼륨 분석 액션 시작: volume_id={volume_id}, region={region}, detailed={detailed_report}, thread={thread_ts}, initial_ts={initial_message_ts}")
 
     analysis_result = None
     error_occurred = False
 
     try:
-        # 분석 시작 알림 (스레드)
+        # Notify start (in thread)
         if channel_id and thread_ts and send_slack_message and SLACK_BOT_TOKEN:
             analysis_target = f"볼륨 `{volume_id}`" if volume_id else "전체 EBS 볼륨"
             send_slack_message(channel_id, f"{analysis_target} 분석을 시작합니다...", SLACK_BOT_TOKEN, thread_ts)
 
-        # 실제 분석 실행 (ebs_service 함수 호출)
+        # 실제 분석 실행 (ebs_service 함수 호출) - Pass initial_message_ts
         if volume_id:
+            # Pass initial_message_ts and slack info if specific volume analysis needs updates (less likely)
             analysis_result = analyze_specific_volume(volume_id, region, detailed_report)
         else:
-            analysis_result = analyze_all_regions(detailed_report=detailed_report) # event 객체 불필요
+            # Pass initial_message_ts and slack info for progress updates
+            analysis_result = analyze_all_regions(detailed_report=detailed_report, 
+                                              initial_message_ts=initial_message_ts,
+                                              channel_id=channel_id, 
+                                              bot_token=SLACK_BOT_TOKEN)
 
         # 분석 결과 확인
         if not analysis_result or 'error' in analysis_result:
@@ -405,36 +423,20 @@ def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None)
              logger.info(f"전체 분석 결과 S3 저장 위치: {s3_location}")
 
 
-        # Slack 결과 알림
-        if channel_id and SLACK_BOT_TOKEN:
-            if volume_id:
-                # 단일 볼륨 분석 결과 전송 (메인 채널, 버튼 포함)
-                if send_analysis_result_to_slack:
-                    send_success, msg_ts = send_analysis_result_to_slack(
-                        analysis_result, channel_id, SLACK_BOT_TOKEN, use_thread=False # 메인 채널에 전송
-                    )
-                    logger.info(f"단일 볼륨 분석 결과 Slack 전송 성공: {send_success}, ts: {msg_ts}")
-
-                    # 세부 정보는 스레드에 전송 (detailed_report=True 인 경우)
-                    if thread_ts and detailed_report and send_slack_message:
-                         details_text = format_single_volume_details(analysis_result)
-                         send_slack_message(channel_id, details_text, SLACK_BOT_TOKEN, thread_ts)
-
-                else: logger.warning("send_analysis_result_to_slack 함수 사용 불가")
-
-            else:
-                # 전체 볼륨 분석 결과 전송 (메인 채널, 버튼 포함)
-                 if send_all_regions_analysis_result_to_slack:
-                      send_success, msg_ts = send_all_regions_analysis_result_to_slack(
-                           analysis_result, channel_id, SLACK_BOT_TOKEN, use_thread=False # 메인 채널에 전송
-                      )
-                      logger.info(f"전체 볼륨 분석 결과 Slack 전송 성공: {send_success}, ts: {msg_ts}")
-
-                      # S3 저장 위치 정보는 스레드에 전송
-                      if thread_ts and send_slack_message:
-                           send_slack_message(channel_id, f"전체 분석 결과가 S3에 저장되었습니다: {s3_location}", SLACK_BOT_TOKEN, thread_ts)
-
-                 else: logger.warning("send_all_regions_analysis_result_to_slack 함수 사용 불가")
+        # Slack 결과 알림 - Use initial_message_ts for update
+        if channel_id and SLACK_BOT_TOKEN and send_analysis_summary_to_slack:
+             send_success, final_ts = send_analysis_summary_to_slack(
+                 analysis_result=analysis_result,
+                 channel_id=channel_id,
+                 bot_token=SLACK_BOT_TOKEN,
+                 message_ts_to_update=initial_message_ts # Use initial_ts for update
+             )
+             if send_success:
+                 logger.info(f"Analysis result sent/updated to Slack. Final TS (or updated TS): {final_ts}")
+             else:
+                 logger.error("Failed to send/update analysis result to Slack.")
+        elif not send_analysis_summary_to_slack:
+             logger.warning("send_analysis_summary_to_slack function not available. Cannot send Slack notification.")
 
         return {
             "success": True,
@@ -505,7 +507,7 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
     if RecommendationExecutor is None:
         logger.error("RecommendationExecutor가 임포트되지 않았습니다.")
         return {"success": False, "error": "Executor not available"}
-    if send_slack_message is None or update_analysis_result_message is None or send_execution_result_to_slack is None:
+    if send_slack_message is None or send_execution_result_to_slack is None:
          logger.warning("Slack 메시징 함수 일부가 임포트되지 않았습니다.")
          # 진행은 가능하나 알림이 실패할 수 있음
 
@@ -526,11 +528,11 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         return {"success": False, "error": err_msg}
 
     try:
-        # 실행 시작 알림 (스레드)
+        # Notify start (in thread)
         if channel_id and thread_ts and send_slack_message and SLACK_BOT_TOKEN:
             send_slack_message(
                 channel_id,
-                f"볼륨 `{volume_id}`에 대한 `{action_type}` 액션 실행을 시작합니다...",
+                f"Starting execution of `{action_type}` for volume `{volume_id}`...",
                 SLACK_BOT_TOKEN,
                 thread_ts
             )
@@ -546,10 +548,16 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
             result_payload = {'success': False, 'error': error_msg, 'status_message': f'오류 (사전 확인): {error_msg}'}
             # 오류 알림 (원본 메시지 업데이트 또는 스레드 메시지)
             if channel_id and SLACK_BOT_TOKEN:
-                if message_ts and update_analysis_result_message:
-                    update_analysis_result_message(
-                        result_payload, volume_id, action_type, channel_id,
-                        requested_by, SLACK_BOT_TOKEN, message_ts
+                # Use send_execution_result_to_slack for updates as well
+                if message_ts and send_execution_result_to_slack:
+                    send_execution_result_to_slack(
+                        result=result_payload, 
+                        volume_id=volume_id, 
+                        action_type=action_type, 
+                        channel_id=channel_id,
+                        requested_by=requested_by, 
+                        bot_token=SLACK_BOT_TOKEN, 
+                        message_ts_to_update=message_ts # Pass message_ts for update
                     )
                 elif thread_ts and send_slack_message:
                     send_slack_message(channel_id, f"액션 오류(사전 확인): {error_msg}", SLACK_BOT_TOKEN, thread_ts)
@@ -587,20 +595,22 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
 
         # 결과 알림 (원본 메시지 업데이트 또는 스레드 결과 표시)
         if channel_id and SLACK_BOT_TOKEN:
-            if message_ts and update_analysis_result_message:
+            # Use send_execution_result_to_slack for updates
+            if message_ts and send_execution_result_to_slack:
                 # 원본 메시지 업데이트 시도
-                update_success = update_analysis_result_message(
-                    execution_result, volume_id, action_type, channel_id,
-                    requested_by, SLACK_BOT_TOKEN, message_ts
+                update_success = send_execution_result_to_slack(
+                    result=execution_result, 
+                    volume_id=volume_id, 
+                    action_type=action_type, 
+                    channel_id=channel_id,
+                    requested_by=requested_by, 
+                    bot_token=SLACK_BOT_TOKEN, 
+                    message_ts_to_update=message_ts # Pass message_ts for update
                 )
                 logger.info(f"Slack 원본 메시지 업데이트 시도 결과: {update_success}")
-                if not update_success and thread_ts and send_execution_result_to_slack:
-                     # 업데이트 실패 시 스레드에 결과 전송
-                     logger.warning(f"원본 메시지({message_ts}) 업데이트 실패, 스레드({thread_ts})에 결과 전송 시도")
-                     send_execution_result_to_slack(
-                         execution_result, volume_id, action_type, channel_id,
-                         requested_by, SLACK_BOT_TOKEN, thread_ts
-                     )
+                # 업데이트 실패 시 스레드에 결과 전송 (이미 send_execution_result_to_slack 에서 처리할 수 있음, 로깅만 남김)
+                if not update_success:
+                     logger.warning(f"원본 메시지({message_ts}) 업데이트 실패 또는 응답 없음")
             elif thread_ts and send_execution_result_to_slack:
                  # message_ts가 없거나 업데이트 함수가 없으면 스레드에 결과 전송
                  send_execution_result_to_slack(
@@ -624,10 +634,16 @@ def process_execute_action(parameters, requested_by, channel_id, response_url=No
         # 오류 발생 시 Slack 알림 (원본 메시지 업데이트 또는 스레드)
         if channel_id and SLACK_BOT_TOKEN:
              message_ts = parameters.get('message_ts')
-             if message_ts and update_analysis_result_message:
-                 update_analysis_result_message(
-                     error_payload, volume_id, action_type, channel_id,
-                     requested_by, SLACK_BOT_TOKEN, message_ts
+             # Use send_execution_result_to_slack for updates
+             if message_ts and send_execution_result_to_slack:
+                 send_execution_result_to_slack(
+                     result=error_payload, 
+                     volume_id=volume_id, 
+                     action_type=action_type, 
+                     channel_id=channel_id,
+                     requested_by=requested_by, 
+                     bot_token=SLACK_BOT_TOKEN, 
+                     message_ts_to_update=message_ts # Pass message_ts for update
                  )
              elif thread_ts and send_slack_message:
                  send_slack_message(

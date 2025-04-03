@@ -23,6 +23,12 @@ except ImportError as e:
     # EBSAnalyzer 임포트 실패 시 처리는 더 복잡할 수 있음
     EBSAnalyzer = None # 또는 오류 발생 처리
 
+# Import Slack messenger for updates (adjust path if necessary)
+try:
+    from integrations.slack.slack_messenger import _update_slack_message
+except ImportError:
+    _update_slack_message = None
+    logging.warning("Failed to import _update_slack_message for progress updates.")
 
 # 로깅 설정
 logger = logging.getLogger(__name__)
@@ -134,12 +140,14 @@ def analyze_specific_volume(volume_id, region=None, detailed_report=False):
             "recommendation": "볼륨 분석 중 예기치 않은 오류가 발생했습니다."
         }
 
-def analyze_all_regions(detailed_report=False):
+def analyze_all_regions(detailed_report=False, initial_message_ts=None, channel_id=None, bot_token=None):
     """
-    모든 리전의 모든 볼륨을 분석합니다.
-    (수정: suggested_actions에 is_attached 정보 포함)
+    모든 리전의 모든 볼륨을 분석합니다. 진행 상황을 주기적으로 Slack 메시지로 업데이트합니다.
 
     :param detailed_report: 상세 보고서 여부
+    :param initial_message_ts: 업데이트할 초기 Slack 메시지 타임스탬프
+    :param channel_id: Slack 채널 ID
+    :param bot_token: Slack 봇 토큰
     :return: 분석 결과
     """
     if EBSAnalyzer is None:
@@ -149,7 +157,6 @@ def analyze_all_regions(detailed_report=False):
         logger.warning("분석할 AWS 리전이 설정되지 않았습니다.")
         return {"error": "분석할 리전 없음"}
 
-    # 전체 분석 결과를 저장할 딕셔너리
     all_results = {
         "timestamp": datetime.now().isoformat(),
         "regions": {},
@@ -160,90 +167,125 @@ def analyze_all_regions(detailed_report=False):
             "suggested_actions": []
         }
     }
+    total_regions = len(REGIONS)
+    processed_regions_count = 0
 
-    # 설정된 각 리전에 대해 분석 실행
     for region in REGIONS:
-        logger.info(f"{region} 리전에 대한 EBS 볼륨 분석 시작")
+        logger.info(f"{region} 리전에 대한 EBS 볼륨 분석 시작 (analyze_specific_volume 재사용)")
+        all_results["regions"][region] = {
+            "idle_volumes_count": 0,
+            "overprovisioned_volumes_count": 0,
+            "analyzed_volumes_count": 0,
+            "errors_count": 0,
+            "details": [] # 상세 보고서용
+        }
+        region_savings = 0
+        region_volumes_analyzed = 0
+        region_volumes_total = 0
 
-        # EBS 분석기 초기화
         try:
             analyzer = EBSAnalyzer(region)
+            volumes_in_region = analyzer.get_all_volumes()
+            region_volumes_total = len(volumes_in_region)
+            logger.info(f"{region} 리전에서 {region_volumes_total}개의 볼륨 발견.")
+            all_results["regions"][region]["total_volumes_found"] = region_volumes_total
+
+            for i, volume_data in enumerate(volumes_in_region):
+                 volume_id = volume_data.get('VolumeId')
+                 if not volume_id:
+                     logger.warning(f"{region} 리전에서 VolumeId 없는 볼륨 데이터 발견: {volume_data}")
+                     continue
+
+                 # --- Progress Update Logic (Example: Update every 50 volumes or at the end of a region) ---
+                 if initial_message_ts and channel_id and bot_token and _update_slack_message and (i % 50 == 0 or i == region_volumes_total - 1):
+                     progress_percent = ((processed_regions_count / total_regions) + ( (i + 1) / region_volumes_total) / total_regions ) * 100
+                     progress_text = f"Analyzing... Region {processed_regions_count + 1}/{total_regions} ({region}): Volume {i + 1}/{region_volumes_total}. Overall progress: {progress_percent:.1f}%"
+                     logger.info(f"Sending progress update: {progress_text}")
+                     # Use a simple text block for progress
+                     progress_blocks = [{
+                         "type": "context",
+                         "elements": [{"type": "mrkdwn", "text": progress_text}]
+                     }]
+                     _update_slack_message(channel_id, bot_token, initial_message_ts, progress_blocks, progress_text)
+                 # --- End Progress Update --- 
+
+                 # 각 볼륨에 대해 analyze_specific_volume 함수 호출
+                 volume_result = analyze_specific_volume(volume_id, region, detailed_report)
+                 all_results["regions"][region]["analyzed_volumes_count"] += 1
+                 region_volumes_analyzed += 1
+
+                 # 결과 처리
+                 if volume_result and 'error' not in volume_result:
+                     is_idle = volume_result.get('is_idle', False)
+                     is_over = volume_result.get('is_overprovisioned', False)
+                     estimated_savings = 0
+
+                     if is_idle:
+                         all_results["regions"][region]["idle_volumes_count"] += 1
+                         all_results["summary"]["total_idle_volumes"] += 1
+                         # 유휴 볼륨 절감액은 월 비용 전체로 가정 (details 에서 가져와야 함)
+                         details = volume_result.get('details', {})
+                         monthly_cost = details.get('monthly_cost', 0) if isinstance(details, dict) else 0
+                         estimated_savings += monthly_cost
+
+                         # Suggested action 추가 (analyze_specific_volume 에서 생성된 것 사용)
+                         if volume_result.get("suggested_action") != "none":
+                              action = volume_result.copy() # 필요한 정보만 추릴 수도 있음
+                              action['estimated_savings'] = monthly_cost # 절감액 명시
+                              all_results["summary"]["suggested_actions"].append(action)
+
+                     elif is_over:
+                         all_results["regions"][region]["overprovisioned_volumes_count"] += 1
+                         all_results["summary"]["total_overprovisioned_volumes"] += 1
+                         # 과대 볼륨 절감액은 overprovisioned_diagnosis 에서 가져와야 함
+                         over_diag = volume_result.get('overprovisioned_diagnosis', {})
+                         over_diag_data = over_diag.get('additional_data', {}) if isinstance(over_diag.get('additional_data'), dict) else {}
+                         savings_from_over = over_diag_data.get('estimated_savings', 0)
+                         estimated_savings += savings_from_over
+
+                         # Suggested action 추가 (analyze_specific_volume 에서 생성된 것 사용)
+                         if volume_result.get("suggested_action") != "none":
+                              action = volume_result.copy()
+                              action['estimated_savings'] = savings_from_over # 절감액 명시
+                              all_results["summary"]["suggested_actions"].append(action)
+
+                     region_savings += estimated_savings
+
+                     # 상세 보고서 요청 시 결과 저장
+                     if detailed_report:
+                         all_results["regions"][region]["details"].append(volume_result)
+                 else:
+                     # 개별 볼륨 분석 오류 처리
+                     logger.error(f"{volume_id} ({region}) 분석 오류: {volume_result.get('error', 'Unknown error')}")
+                     all_results["regions"][region]["errors_count"] += 1
+                     if detailed_report:
+                          all_results["regions"][region]["details"].append(volume_result or {'volume_id': volume_id, 'region': region, 'error': 'Analysis failed'})
+
+        except AttributeError as ae:
+             logger.error(f"{region} 리전 분석 중 오류: EBSAnalyzer에 필요한 메소드(예: get_all_volumes)가 없을 수 있습니다. {ae}", exc_info=True)
+             all_results["regions"][region]["error"] = f"Analyzer method error: {ae}"
         except Exception as e:
-            logger.error(f"EBSAnalyzer({region}) 초기화 중 오류: {e}", exc_info=True)
-            all_results["regions"][region] = {"error": f"분석기 초기화 실패: {e}"}
-            continue # 다음 리전으로 진행
+             logger.error(f"{region} 리전 분석 중 예외 발생: {str(e)}", exc_info=True)
+             all_results["regions"][region]["error"] = f"리전 분석 중 오류: {e}"
 
-        # 분석 실행
-        try:
-            region_results = analyzer.analyze_volumes()
+        all_results["summary"]["total_estimated_savings"] += region_savings
+        processed_regions_count += 1 # Increment after processing a region
 
-            # 유휴 볼륨 및 과대 프로비저닝 볼륨 개수 저장
-            idle_count = len(region_results.get('idle_volumes', []))
-            over_count = len(region_results.get('overprovisioned_volumes', []))
-
-            # 리전별 요약 정보
-            all_results["regions"][region] = {
-                "idle_volumes_count": idle_count,
-                "overprovisioned_volumes_count": over_count,
-                "total_volumes": region_results.get('total_volumes', 0)
-            }
-
-            # 상세 보고서가 요청된 경우 상세 정보 추가
-            if detailed_report:
-                all_results["regions"][region]["details"] = region_results
-
-            # 요약 정보에 추가
-            all_results["summary"]["total_idle_volumes"] += idle_count
-            all_results["summary"]["total_overprovisioned_volumes"] += over_count
-
-            # 권장 조치 추가 (is_attached 정보 포함)
-            for volume in region_results.get('idle_volumes', []):
-                monthly_cost = volume.get('monthly_cost', 0)
-                all_results["summary"]["total_estimated_savings"] += monthly_cost
-                is_attached = len(volume.get('Attachments', [])) > 0 # Check attachment status here
-                action_type_suggestion = "snapshot_and_delete" if not is_attached else "snapshot_only"
-
-                all_results["summary"]["suggested_actions"].append({
-                    "volume_id": volume.get('volume_id'),
-                    "region": region,
-                    "is_attached": is_attached, # Add attachment status
-                    "action_type": "idle_volume_action", # Generic type for categorization
-                    "action_params": {
-                        "volume_id": volume.get('volume_id'),
-                        "region": region,
-                        # Store the initially suggested action based on attachment status
-                        "action_type": action_type_suggestion
-                    },
-                    "estimated_savings": monthly_cost,
-                    "recommendation": volume.get('recommendation', '')
-                })
-
-            for volume in region_results.get('overprovisioned_volumes', []):
-                estimated_savings = volume.get('estimated_savings', 0)
-                all_results["summary"]["total_estimated_savings"] += estimated_savings
-                # Overprovisioned volumes are assumed to be attached if in use
-                is_attached = len(volume.get('Attachments', [])) > 0
-
-                all_results["summary"]["suggested_actions"].append({
-                    "volume_id": volume.get('volume_id'),
-                    "region": region,
-                    "is_attached": is_attached, # Add attachment status
-                    "action_type": "overprovisioned_volume_action", # Generic type
-                    "action_params": {
-                        "volume_id": volume.get('volume_id'),
-                        "region": region,
-                        "action_type": "resize"
-                    },
-                    "estimated_savings": estimated_savings,
-                    "recommendation": volume.get('recommendation', '')
-                })
-        except Exception as e:
-            logger.error(f"{region} 리전 분석 중 예외 발생: {str(e)}", exc_info=True)
-            all_results["regions"][region] = {"error": f"리전 분석 중 오류: {e}"}
-
-
-    # 예상 절감액 소수점 두 자리로 반올림
+    # 최종 절감액 반올림
     all_results["summary"]["total_estimated_savings"] = round(all_results["summary"]["total_estimated_savings"], 2)
+
+    # 권장 조치 목록을 절감액 기준으로 정렬 (선택 사항)
+    all_results["summary"]["suggested_actions"].sort(key=lambda x: x.get('estimated_savings', 0), reverse=True)
+
+    # Final update before returning (optional, as sqs_handler will update with full results)
+    if initial_message_ts and channel_id and bot_token and _update_slack_message:
+         final_progress_text = f"Analysis complete for all {total_regions} regions. Preparing final summary..."
+         _update_slack_message(channel_id, bot_token, initial_message_ts,
+                              [{
+                                "type": "context",
+                                "elements": [{"type": "mrkdwn", "text": final_progress_text}]
+                              }],
+                              final_progress_text)
 
     return all_results
 

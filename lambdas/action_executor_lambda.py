@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 
 from actions.recommendation_executor import RecommendationExecutor
 from utils.ebs_analyzer import EBSAnalyzer
-from integrations.slack.slack_messenger import send_slack_message, send_analysis_result_to_slack, send_execution_result_to_slack, update_analysis_result_message
+from integrations.slack.slack_messenger import send_slack_message, send_analysis_summary_to_slack, send_execution_result_to_slack, update_analysis_result_message
+from integrations.slack.utils import format_analysis_result_for_slack
 
 # 환경 변수 로드
 load_dotenv()
@@ -213,8 +214,16 @@ def process_analyze_action(parameters, requested_by, channel_id, thread_ts=None)
             
             # Slack 채널에 메시지 전송하고 thread_ts 받기
             if channel_id:
-                success, new_thread_ts = send_analysis_result_to_slack(formatted_result, channel_id, SLACK_BOT_TOKEN)
-                # 분석 결과의 ts를 향후 액션에 사용할 수 있도록 반환값에 포함
+                logger.info(f"분석 결과 슬랙 전송 시도: 채널={channel_id}, 스레드={thread_ts}")
+                # 결과 포맷팅 (기존 함수 활용 또는 Slack Messenger 내에서 처리)
+                formatted_result = format_analysis_result_for_slack(result)
+                
+                # 결과 전송
+                success, new_thread_ts = send_analysis_summary_to_slack(formatted_result, channel_id, SLACK_BOT_TOKEN)
+                if success:
+                    logger.info(f"분석 결과 슬랙 전송 성공: 메시지TS={new_thread_ts}")
+                else:
+                    logger.error("분석 결과 슬랙 전송 실패")
                 formatted_result["thread_ts"] = new_thread_ts
             
             return {
